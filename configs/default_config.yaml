@@ -22,13 +22,13 @@ model:
 engine:
   tensor_parallel_size: 2     # L40s 2개 사용
   pipeline_parallel_size: 1   # 파이프라인 병렬 처리에 사용할 GPU 수
-  gpu_memory_utilization: 0.88  # L40s의 메모리 활용도 최적화
-  max_model_len: 65536       # RAG 시스템에 충분한 컨텍스트
-  max_num_seqs: 48           # 다중 언어 처리 및 코딩을 위해 배치 크기 조정
-  max_num_batched_tokens: 24576  # 큰 컨텍스트 윈도우 활용 (128K)
-  block_size: 32             # KV 캐시 블록 크기 증가 (긴 컨텍스트용)
-  swap_space: 20             # CPU 스왑 공간 크기 (GB)
-  enforce_eager: false       # PyTorch eager 모드 강제 실행 여부
+  gpu_memory_utilization: 0.7  # L40s의 메모리 활용도 최적화
+  max_model_len: 12288       # RAG 시스템에 충분한 컨텍스트
+  max_num_seqs: 32           # 다중 언어 처리 및 코딩을 위해 배치 크기 조정
+  max_num_batched_tokens: 12288  # 큰 컨텍스트 윈도우 활용 (128K)
+  block_size: 16             # KV 캐시 블록 크기 증가 (긴 컨텍스트용)
+  swap_space: 32             # CPU 스왑 공간 크기 (GB)
+  enforce_eager: true       # PyTorch eager 모드 강제 실행 여부
   disable_log_stats: false   # 통계 로깅 비활성화 여부
   dtype: "bfloat16"          # config.json과 일치하는 데이터 타입
   sliding_window: null       # config.json과 일치시킴
@@ -58,7 +58,7 @@ tokenizer:
 
 # 추론 기본 설정
 inference:
-  max_tokens: 2048           # 생성할 최대 토큰 수
+  max_tokens: 4096           # 생성할 최대 토큰 수
   temperature: 0.0           # 샘플링 온도 (0.0 ~ 2.0)
   top_p: 1.0                # 누적 확률 임계값 (0.0 ~ 1.0)
   top_k: 1                  # 샘플링할 최상위 토큰 수
@@ -71,7 +71,7 @@ inference:
 # 모니터링 설정
 monitoring:
   enabled: true              # 모니터링 활성화 여부
-  metrics_port: 8001         # 메트릭 서버 포트
+  metrics_port: 8005         # 메트릭 서버 포트
   log_stats_interval: 10     # 통계 로깅 간격 (초)
   profile_interval: 60       # 프로파일링 간격 (초)
   prometheus: true           # Prometheus 메트릭 활성화 여부
