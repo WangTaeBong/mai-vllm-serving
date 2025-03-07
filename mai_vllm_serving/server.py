@@ -1,5 +1,3 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
 """
 mai-vllm-serving의 핵심 서버 구현
 대용량 언어 모델(LLM)을 효율적으로 서빙하기 위한 고성능 FastAPI 애플리케이션
@@ -18,7 +16,7 @@ import uvicorn
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from mai_vllm_serving.distributed import DistributedVLLMEngine, DistributedConfig
 # 엔진 모듈 임포트
@@ -60,16 +58,14 @@ request_logger = get_request_logger()
 class GenerationRequest(BaseModel):
     """LLM 생성 요청을 위한 모델"""
     prompt: str
-    max_tokens: int = Field(default=config.inference.max_tokens, ge=1, le=8192, description="생성할 최대 토큰 수")
-    temperature: float = Field(default=config.inference.temperature, ge=0.0, le=2.0,
-                               description="샘플링 온도, 높을수록 더 다양한 출력")
-    top_p: float = Field(default=config.inference.top_p, ge=0.0, le=1.0, description="누적 확률 임계값")
-    top_k: int = Field(default=config.inference.top_k, ge=0, description="샘플링할 최상위 토큰 수")
-    frequency_penalty: float = Field(default=config.inference.frequency_penalty, ge=0.0, le=2.0, description="빈도 페널티")
-    presence_penalty: float = Field(default=config.inference.presence_penalty, ge=0.0, le=2.0, description="존재 페널티")
-    repetition_penalty: float = Field(default=config.inference.repetition_penalty, ge=1.0, le=2.0, description="반복 페널티")
-    no_repeat_ngram_size: int = Field(default=config.inference.no_repeat_ngram_size, ge=0,
-                                      description="반복하지 않을 n-gram 크기")
+    request_id: Optional[str] = Field(default=None, description="요청 ID (제공하지 않을 경우 자동 생성)")
+    max_tokens: Optional[int] = Field(default=None, ge=1, le=8192, description="생성할 최대 토큰 수")
+    temperature: Optional[float] = Field(default=None, ge=0.0, le=2.0, description="샘플링 온도, 높을수록 더 다양한 출력")
+    top_p: Optional[float] = Field(default=None, ge=0.0, le=1.0, description="누적 확률 임계값")
+    top_k: Optional[int] = Field(default=None, ge=0, description="샘플링할 최상위 토큰 수")
+    frequency_penalty: Optional[float] = Field(default=None, ge=0.0, le=2.0, description="빈도 페널티")
+    presence_penalty: Optional[float] = Field(default=None, ge=0.0, le=2.0, description="존재 페널티")
+    repetition_penalty: Optional[float] = Field(default=None, ge=1.0, le=2.0, description="반복 페널티")
     stop: Optional[Union[str, List[str]]] = Field(default=None, description="생성 중단 시퀀스")
     stream: bool = Field(default=False, description="스트리밍 모드 사용 여부")
 
@@ -79,19 +75,43 @@ class GenerationRequest(BaseModel):
             raise ValueError('프롬프트는 비어있을 수 없습니다')
         return v.strip()
 
+    @field_validator('request_id')
+    def request_id_validate(cls, v):
+        if v is not None and not v.strip():
+            raise ValueError('request_id가 제공된 경우 비어있을 수 없습니다')
+        return v.strip() if v is not None else v
 
-# 한글 인코딩 설정
-try:
-    locale.setlocale(locale.LC_ALL, 'ko_KR.UTF-8')
-except locale.Error:
-    try:
-        locale.setlocale(locale.LC_ALL, '.UTF-8')
-    except locale.Error:
-        logger.warning("Failed to set Korean locale. Falling back to default locale.")
+    @model_validator(mode='after')
+    def set_default_from_config(self):
+        # 설정 객체 가져오기
+        cfg = get_config()
 
-# 기본 인코딩 확인 및 설정
-if sys.stdout.encoding != 'utf-8':
-    logger.warning(f"System stdout encoding is {sys.stdout.encoding}, recommended UTF-8")
+        # 값이 None인 경우 환경설정에서 가져오기
+        if self.max_tokens is None:
+            self.max_tokens = getattr(cfg.inference, 'max_tokens', 4096)
+
+        if self.temperature is None:
+            self.temperature = getattr(cfg.inference, 'temperature', 0.1)
+
+        if self.top_p is None:
+            self.top_p = getattr(cfg.inference, 'top_p', 0.9)
+
+        if self.top_k is None:
+            self.top_k = getattr(cfg.inference, 'top_k', 50)
+
+        if self.frequency_penalty is None:
+            self.frequency_penalty = getattr(cfg.inference, 'frequency_penalty', 0.0)
+
+        if self.presence_penalty is None:
+            self.presence_penalty = getattr(cfg.inference, 'presence_penalty', 0.2)
+
+        if self.repetition_penalty is None:
+            self.repetition_penalty = getattr(cfg.inference, 'repetition_penalty', 1.1)
+
+        if self.stop is None:
+            self.stop = getattr(cfg.inference, 'stop', None)
+
+        return self
 
 
 @asynccontextmanager
@@ -312,9 +332,11 @@ async def generate(request: GenerationRequest, background_tasks: BackgroundTasks
     # global llm_engine  # 명시적으로 글로벌 변수 참조
 
     # 요청 ID 생성 및 로깅
-    request_id = str(uuid.uuid4())
+    request_id = request.request_id if request.request_id else str(uuid.uuid4())
     client_ip = client_request.client.host if client_request.client else "unknown"
-    request_data = request.dict()
+    request_data = request.model_dump()
+    # 실제 사용될 request_id를 request_data에 업데이트
+    request_data['request_id'] = request_id
 
     request_logger.log_request(
         request_data=request_data,
@@ -337,7 +359,6 @@ async def generate(request: GenerationRequest, background_tasks: BackgroundTasks
                 frequency_penalty=request.frequency_penalty,
                 presence_penalty=request.presence_penalty,
                 repetition_penalty=request.repetition_penalty,
-                # no_repeat_ngram_size=request.no_repeat_ngram_size,
                 stop=request.stop,
                 stream=request.stream,
                 request_id=request_id,

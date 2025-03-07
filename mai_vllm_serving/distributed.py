@@ -1,5 +1,3 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
 """
 mai-vllm-serving의 분산 처리 구현
 다중 GPU 환경에서 vLLM을 효율적으로 분산 처리하기 위한 기능
@@ -621,15 +619,13 @@ class DistributedVLLMEngine:
         """엔진 요청 객체 생성"""
         return RequestConfig(
             prompt=req_config.prompt,
-            # 아래 값들은 요청에 있을 경우 그 값을 사용, 없으면 config의 기본값 사용
-            max_tokens=req_config.max_tokens if req_config.max_tokens is not None else config.inference.max_tokens,
-            temperature=req_config.temperature if req_config.temperature is not None else config.inference.temperature,
-            top_p=req_config.top_p if req_config.top_p is not None else config.inference.top_p,
-            top_k=req_config.top_k if req_config.top_k is not None else config.inference.top_k,
-            frequency_penalty=req_config.frequency_penalty if req_config.frequency_penalty is not None else config.inference.frequency_penalty,
-            presence_penalty=req_config.presence_penalty if req_config.presence_penalty is not None else config.inference.presence_penalty,
-            repetition_penalty=req_config.repetition_penalty if req_config.repetition_penalty is not None else config.inference.repetition_penalty,
-            # no_repeat_ngram_size=req_config.no_repeat_ngram_size if req_config.no_repeat_ngram_size is not None else config.inference.no_repeat_ngram_size,
+            max_tokens=req_config.max_tokens,
+            temperature=req_config.temperature,
+            top_p=req_config.top_p,
+            top_k=req_config.top_k,
+            frequency_penalty=req_config.frequency_penalty,
+            presence_penalty=req_config.presence_penalty,
+            repetition_penalty=req_config.repetition_penalty,
             stop=req_config.stop,
             stream=req_config.stream,
             request_id=req_config.request_id,

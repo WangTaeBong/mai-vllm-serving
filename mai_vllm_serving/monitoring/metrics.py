@@ -1,5 +1,3 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
 """
 mai-vllm-serving의 모니터링 지표 모듈
 성능, 리소스 사용량, 요청 처리 등에 관한 지표를 수집하고 관리

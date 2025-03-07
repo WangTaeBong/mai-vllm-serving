@@ -1,5 +1,3 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
 """
 mai-vllm-serving 로깅 유틸리티
 로깅 설정 및 관리를 위한 유틸리티 함수

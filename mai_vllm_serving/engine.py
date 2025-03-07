@@ -41,18 +41,17 @@ logger = setup_logging(
 class RequestConfig:
     """추론 요청 설정을 위한 데이터 클래스"""
     prompt: str
-    max_tokens: int = config.inference.max_tokens
-    temperature: float = config.inference.temperature
-    top_p: float = config.inference.top_p
-    top_k: int = config.inference.top_k
-    frequency_penalty: float = config.inference.frequency_penalty
-    presence_penalty: float = config.inference.presence_penalty
-    repetition_penalty: float = config.inference.repetition_penalty
-    # no_repeat_ngram_size: int = config.inference.no_repeat_ngram_size
+    max_tokens: Optional[int] = None
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    top_k: Optional[int] = None
+    frequency_penalty: Optional[float] = None
+    presence_penalty: Optional[float] = None
+    repetition_penalty: Optional[float] = None
     stop: Optional[Union[str, List[str]]] = None
     stream: bool = False
     request_id: Optional[str] = None
-    seed: Optional[int] = config.inference.seed
+    seed: Optional[int] = None
 
     def to_sampling_params(self) -> SamplingParams:
         """
@@ -61,18 +60,20 @@ class RequestConfig:
         Returns:
             SamplingParams: vLLM에서 사용할 샘플링 파라미터
         """
+        # 환경 설정에서 기본값 가져오기
+        cfg = get_config()
+
         return SamplingParams(
-            max_tokens=self.max_tokens,
-            temperature=self.temperature,
-            top_p=self.top_p,
-            top_k=self.top_k,
-            frequency_penalty=self.frequency_penalty,
-            presence_penalty=self.presence_penalty,
-            repetition_penalty=self.repetition_penalty,
+            max_tokens=self.max_tokens if self.max_tokens is not None else cfg.inference.max_tokens,
+            temperature=self.temperature if self.temperature is not None else cfg.inference.temperature,
+            top_p=self.top_p if self.top_p is not None else cfg.inference.top_p,
+            top_k=self.top_k if self.top_k is not None else cfg.inference.top_k,
+            frequency_penalty=self.frequency_penalty if self.frequency_penalty is not None else cfg.inference.frequency_penalty,
+            presence_penalty=self.presence_penalty if self.presence_penalty is not None else cfg.inference.presence_penalty,
+            repetition_penalty=self.repetition_penalty if self.repetition_penalty is not None else cfg.inference.repetition_penalty,
             stop=self.stop,
-            seed=self.seed,
+            seed=self.seed if self.seed is not None else cfg.inference.seed,
             ignore_eos=False
-            # no_repeat_ngram_size=self.no_repeat_ngram_size
         )
 
 
@@ -283,15 +284,13 @@ class MAIVLLMEngine:
                     # engine_request 생성 시 요청 값 우선 사용, 없을 경우에만 기본값 적용
                     engine_request = RequestConfig(
                         prompt=req_config.prompt,
-                        # 아래 값들은 요청에 있을 경우 그 값을 사용, 없으면 config의 기본값 사용
-                        max_tokens=req_config.max_tokens if req_config.max_tokens is not None else config.inference.max_tokens,
-                        temperature=req_config.temperature if req_config.temperature is not None else config.inference.temperature,
-                        top_p=req_config.top_p if req_config.top_p is not None else config.inference.top_p,
-                        top_k=req_config.top_k if req_config.top_k is not None else config.inference.top_k,
-                        frequency_penalty=req_config.frequency_penalty if req_config.frequency_penalty is not None else config.inference.frequency_penalty,
-                        presence_penalty=req_config.presence_penalty if req_config.presence_penalty is not None else config.inference.presence_penalty,
-                        repetition_penalty=req_config.repetition_penalty if req_config.repetition_penalty is not None else config.inference.repetition_penalty,
-                        # no_repeat_ngram_size=req_config.no_repeat_ngram_size if req_config.no_repeat_ngram_size is not None else config.inference.no_repeat_ngram_size,
+                        max_tokens=req_config.max_tokens,
+                        temperature=req_config.temperature,
+                        top_p=req_config.top_p,
+                        top_k=req_config.top_k,
+                        frequency_penalty=req_config.frequency_penalty,
+                        presence_penalty=req_config.presence_penalty,
+                        repetition_penalty=req_config.repetition_penalty,
                         stop=req_config.stop,
                         stream=req_config.stream,
                         request_id=req_config.request_id,

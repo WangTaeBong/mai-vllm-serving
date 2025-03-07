@@ -1,5 +1,3 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
 """
 mai-vllm-serving 설정 관리 모듈
 YAML 설정 파일을 로드하고 관리하는 기능 제공
