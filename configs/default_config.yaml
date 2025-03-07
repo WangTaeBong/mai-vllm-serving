@@ -12,7 +12,7 @@ server:
 
 # 모델 설정
 model:
-  name: "./models/AI-Korean-Mistral-Nemo-sft-dpo-12B"  # 로컬 모델 경로
+  name: "/data/vllm-models/AI-Korean-Mistral-Nemo-sft-dpo-12B"  # 로컬 모델 경로
   revision: "main"          # 모델 리비전
   cache_dir: "./models"     # 모델 캐시 디렉토리
   download_dir: "./models"  # 모델 다운로드 디렉토리
@@ -22,12 +22,12 @@ model:
 engine:
   tensor_parallel_size: 2     # L40s 2개 사용
   pipeline_parallel_size: 1   # 파이프라인 병렬 처리에 사용할 GPU 수
-  gpu_memory_utilization: 0.90  # L40s의 메모리 활용도 최적화
-  max_model_len: 131072
-  max_num_seqs: 64           # 다중 언어 처리 및 코딩을 위해 배치 크기 조정
-  max_num_batched_tokens: 32768  # 큰 컨텍스트 윈도우 활용 (128K)
-  block_size: 64             # KV 캐시 블록 크기 증가 (긴 컨텍스트용)
-  swap_space: 16             # CPU 스왑 공간 크기 (GB)
+  gpu_memory_utilization: 0.88  # L40s의 메모리 활용도 최적화
+  max_model_len: 65536       # RAG 시스템에 충분한 컨텍스트
+  max_num_seqs: 48           # 다중 언어 처리 및 코딩을 위해 배치 크기 조정
+  max_num_batched_tokens: 24576  # 큰 컨텍스트 윈도우 활용 (128K)
+  block_size: 32             # KV 캐시 블록 크기 증가 (긴 컨텍스트용)
+  swap_space: 20             # CPU 스왑 공간 크기 (GB)
   enforce_eager: false       # PyTorch eager 모드 강제 실행 여부
   disable_log_stats: false   # 통계 로깅 비활성화 여부
   dtype: "bfloat16"          # config.json과 일치하는 데이터 타입
@@ -45,7 +45,7 @@ quantization:
 distributed:
   world_size: 1              # 분산 처리에 참여하는 총 프로세스 수
   backend: "nccl"            # 분산 통신 백엔드 (nccl: GPU, gloo: CPU)
-  master_addr: "localhost"   # 마스터 프로세스의 주소
+  master_addr: "127.0.0.1"   # 마스터 프로세스의 주소
   master_port: "29500"       # 마스터 프로세스의 포트
   timeout: 1800              # 분산 통신 타임아웃 (초)
 
@@ -59,13 +59,13 @@ tokenizer:
 # 추론 기본 설정
 inference:
   max_tokens: 2048           # 생성할 최대 토큰 수
-  temperature: 0.7           # 샘플링 온도 (0.0 ~ 2.0)
-  top_p: 0.95                # 누적 확률 임계값 (0.0 ~ 1.0)
-  top_k: 50                  # 샘플링할 최상위 토큰 수
+  temperature: 0.0           # 샘플링 온도 (0.0 ~ 2.0)
+  top_p: 1.0                # 누적 확률 임계값 (0.0 ~ 1.0)
+  top_k: 1                  # 샘플링할 최상위 토큰 수
   frequency_penalty: 0.0     # 빈도 페널티 (0.0 ~ 2.0)
   presence_penalty: 0.0      # 존재 페널티 (0.0 ~ 2.0)
-  repetition_penalty: 1.05   # 반복 페널티 (1.0 ~ 2.0)
-  no_repeat_ngram_size: 4    # 반복하지 않을 n-gram 크기
+  repetition_penalty: 1.0   # 반복 페널티 (1.0 ~ 2.0)
+  no_repeat_ngram_size: 0    # 반복하지 않을 n-gram 크기
   seed: 42                   # 랜덤 시드 (null: 랜덤)
 
 # 모니터링 설정
@@ -81,9 +81,9 @@ monitoring:
 # 캐싱 설정
 caching:
   enabled: true              # 캐싱 활성화 여부
-  prompt_cache_size: 1000    # 프롬프트 캐시 크기
-  result_cache_size: 1000    # 결과 캐시 크기
-  ttl: 3600                  # 캐시 항목 수명 (초)
+  prompt_cache_size: 2000    # 프롬프트 캐시 크기
+  result_cache_size: 2000    # 결과 캐시 크기
+  ttl: 7200                  # 캐시 항목 수명 (초)
 
 # 로깅 설정
 logging:
