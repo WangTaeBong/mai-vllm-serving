@@ -642,7 +642,7 @@ class DistributedVLLMEngine:
                                 timing: TimingContext,
                                 metrics_collector=None) -> AsyncGenerator[Dict[str, Any], None]:
         """
-        스트리밍 생성 요청 처리를 위한 제너레이터 (배치 처리 적용)
+        스트리밍 생성 요청 처리를 위한 제너레이터 (배치 처리 적용, 네트워크 효율성 향상)
 
         Args:
             engine_request: 요청 객체
@@ -656,6 +656,7 @@ class DistributedVLLMEngine:
         request_id = engine_request.request_id
         stream_finished = False
         previous_text_length = 0  # 이전 텍스트 길이 추적용 변수
+        is_first_response = True  # 첫 번째 응답 여부 체크
 
         # 배치 처리 관련 변수
         batch_size_chars = 20  # 약 5-10개 토큰에 해당 (한글은 대략 2-3자가 1토큰)
@@ -695,20 +696,27 @@ class DistributedVLLMEngine:
                 )
 
                 if should_send_batch and current_batch:  # 배치에 내용이 있을 경우에만 전송
-                    # 배치 전송
-                    yield {
+                    # 응답 객체 구성
+                    response = {
                         "id": request_id,
-                        "new_text": current_batch,  # 새로 생성된 텍스트 배치
-                        "generated_text": current_text,  # 호환성을 위해 전체 텍스트도 포함
+                        "new_text": current_batch,
                         "finished": is_finished,
                         "finish_reason": output.finish_reason
                     }
+
+                    # 전체 텍스트는 첫 번째 응답과 마지막 응답에만 포함
+                    if is_first_response or is_finished:
+                        response["generated_text"] = current_text
+                        is_first_response = False
+
+                    # 배치 전송
+                    yield response
 
                     # 배치 초기화 및 전송 시간 업데이트
                     current_batch = ""
                     last_send_time = current_time
 
-                # 마지막 출력인 경우 통계 업데이트
+                # 마지막 출력인 경우 통계 업데이트 (스트림이 완료되었고 아직 처리되지 않은 경우)
                 if is_finished and not stream_finished:
                     stream_finished = True
 

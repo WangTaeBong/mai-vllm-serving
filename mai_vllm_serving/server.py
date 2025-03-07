@@ -235,7 +235,11 @@ app.add_middleware(
 async def add_utf8_header(request: Request, call_next):
     """UTF-8 인코딩 헤더 추가 미들웨어"""
     response = await call_next(request)
-    response.headers["Content-Type"] = "application/json; charset=utf-8"
+    # 스트리밍 응답에 대해 Content-Type 헤더 설정
+    if "text/event-stream" in response.headers.get("content-type", ""):
+        response.headers["Content-Type"] = "text/event-stream; charset=utf-8"
+    else:
+        response.headers["Content-Type"] = "application/json; charset=utf-8"
     return response
 
 
@@ -396,7 +400,8 @@ async def _stream_response_generator(engine_request: RequestConfig, timing: Timi
         # 엔진에서 스트리밍 응답 반환 - 제너레이터이므로 그대로 사용 가능
         llm_engine = EngineManager.get_instance()
         async for chunk in await llm_engine.generate(engine_request):
-            response_json = json.dumps(chunk)
+            # UTF-8 인코딩을 보장하는 JSON 직렬화
+            response_json = json.dumps(chunk, ensure_ascii=False)
             yield f"data: {response_json}\n\n"
 
             # 완료 시 로깅
@@ -411,7 +416,7 @@ async def _stream_response_generator(engine_request: RequestConfig, timing: Timi
             "id": engine_request.request_id,
             "error": str(e),
             "finished": True
-        })
+        }, ensure_ascii=False)
         yield f"data: {error_json}\n\n"
 
     # 스트림 종료
