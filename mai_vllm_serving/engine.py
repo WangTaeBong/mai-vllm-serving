@@ -7,7 +7,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Union, Any, AsyncIterator
+from typing import Dict, List, Optional, Union, Any, AsyncIterator, AsyncGenerator
 
 import torch
 from vllm import SamplingParams
@@ -368,9 +368,9 @@ class MAIVLLMEngine:
     async def _stream_generator(self, engine_request: RequestConfig,
                                 sampling_params: SamplingParams,
                                 timing: TimingContext,
-                                metrics_collector=None) -> AsyncIterator[Dict[str, Any]]:
+                                metrics_collector=None) -> AsyncGenerator[Dict[str, Any], None]:
         """
-        스트리밍 생성 요청 처리를 위한 제너레이터
+        스트리밍 생성 요청 처리를 위한 제너레이터 (배치 처리 적용)
 
         Args:
             engine_request: 요청 객체
@@ -384,50 +384,85 @@ class MAIVLLMEngine:
         if metrics_collector is None:
             metrics_collector = get_metrics_collector()
 
-        try:
-            # last_output = None
-            # tokens_generated = 0
-            # prompt_tokens = 0
+        request_id = engine_request.request_id
+        stream_finished = False
+        previous_text_length = 0  # 이전 텍스트 길이 추적용 변수
 
+        # 배치 처리 관련 변수
+        batch_size_chars = 20  # 약 5-10개 토큰에 해당 (한글은 대략 2-3자가 1토큰)
+        batch_max_wait_time = 0.1  # 최대 대기 시간 (초)
+        current_batch = ""  # 현재 배치에 모인 텍스트
+        last_send_time = time.time()  # 마지막 전송 시간
+
+        try:
             async for result in self.engine.generate(
                     prompt=engine_request.prompt,
                     sampling_params=sampling_params,
                     request_id=engine_request.request_id):
+
                 output = result.outputs[0]
                 tokens_generated = len(output.token_ids)
                 prompt_tokens = len(result.prompt_token_ids)
 
+                # 새로 생성된 텍스트 부분 계산
+                current_text = output.text
+                new_text = current_text[previous_text_length:]
+                previous_text_length = len(current_text)
+
+                # 새 텍스트를 현재 배치에 추가
+                current_batch += new_text
+                current_time = time.time()
+                time_since_last_send = current_time - last_send_time
+
+                # 배치 전송 조건 확인
+                is_finished = output.finish_reason is not None
+                should_send_batch = (
+                        len(current_batch) >= batch_size_chars or
+                        time_since_last_send >= batch_max_wait_time or
+                        is_finished
+                )
+
+                if should_send_batch and current_batch:  # 배치에 내용이 있을 경우에만 전송
+                    # 배치 전송
+                    yield {
+                        "id": request_id,
+                        "new_text": current_batch,  # 새로 생성된 텍스트 배치
+                        "generated_text": current_text,  # 호환성을 위해 전체 텍스트도 포함
+                        "finished": is_finished,
+                        "finish_reason": output.finish_reason
+                    }
+
+                    # 배치 초기화 및 전송 시간 업데이트
+                    current_batch = ""
+                    last_send_time = current_time
+
                 # 마지막 출력인 경우 통계 업데이트
-                if output.finish_reason is not None:
+                if is_finished and not stream_finished:
+                    stream_finished = True
                     self._update_stats(engine_request.request_id, result, timing)
 
                     # 메트릭 수집기에 완료 기록
                     metrics_collector.complete_request(
-                        engine_request.request_id,
+                        request_id,
                         completion_tokens=tokens_generated,
                         prompt_tokens=prompt_tokens
                     )
 
+                    # 로깅
                     logger.info(
-                        f"Streaming request {engine_request.request_id} completed: {tokens_generated} tokens in "
+                        f"Streaming request {request_id} completed: {tokens_generated} tokens in "
                         f"{timing.duration:.3f}s ({tokens_generated / timing.duration if timing.duration > 0 else 0:.2f} tokens/sec)"
                     )
 
-                # last_output = output
-
-                yield {
-                    "id": engine_request.request_id,
-                    "generated_text": output.text,
-                    "finished": output.finish_reason is not None,
-                    "finish_reason": output.finish_reason
-                }
-
         except Exception as e:
-            logger.error(f"Error in stream generation for request {engine_request.request_id}: {str(e)}", exc_info=True)
+            logger.error(f"Error in stream generation for request {request_id}: {str(e)}", exc_info=True)
+
             # 메트릭 수집기에 실패 기록
-            metrics_collector.fail_request(engine_request.request_id, str(e))
+            metrics_collector.fail_request(request_id, str(e))
+
+            # 오류 정보 반환
             yield {
-                "id": engine_request.request_id,
+                "id": request_id,
                 "error": str(e),
                 "finished": True
             }
