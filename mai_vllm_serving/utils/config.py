@@ -112,7 +112,7 @@ class InferenceConfig:
 class MonitoringConfig:
     """모니터링 설정 클래스"""
     enabled: bool = True
-    metrics_port: int = 8001
+    metrics_port: int = 8005
     log_stats_interval: int = 10
     profile_interval: int = 60
     prometheus: bool = True

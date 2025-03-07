@@ -233,6 +233,9 @@ class MetricsCollector:
         self._stop_event = threading.Event()
         self._collection_thread = None
 
+        # 메트릭 초기화 상태 추적을 위한 변수 추가
+        self._metrics_initialized = False
+
         # 프로메테우스 설정
         if self.enable_prometheus:
             self._setup_prometheus_metrics()
@@ -249,53 +252,82 @@ class MetricsCollector:
         if not HAS_PROMETHEUS:
             return
 
-        # 카운터 지표
-        self.prometheus_metrics["total_requests"] = PromCounter(
-            "vllm_total_requests", "Total number of requests processed"
-        )
-        self.prometheus_metrics["total_successes"] = PromCounter(
-            "vllm_total_successes", "Total number of successful requests"
-        )
-        self.prometheus_metrics["total_failures"] = PromCounter(
-            "vllm_total_failures", "Total number of failed requests"
-        )
-        self.prometheus_metrics["total_tokens_input"] = PromCounter(
-            "vllm_total_tokens_input", "Total number of input tokens processed"
-        )
-        self.prometheus_metrics["total_tokens_output"] = PromCounter(
-            "vllm_total_tokens_output", "Total number of output tokens generated"
-        )
+        # 이미 메트릭이 초기화되었는지 확인하는 클래스 변수 추가
+        if hasattr(self, '_metrics_initialized') and self._metrics_initialized:
+            logger.info("Prometheus metrics already initialized, skipping registration")
+            return
 
-        # 게이지 지표
-        self.prometheus_metrics["active_requests"] = Gauge(
-            "vllm_active_requests", "Number of currently active requests"
-        )
+        try:
+            # 카운터 지표
+            self.prometheus_metrics["total_requests"] = PromCounter(
+                "vllm_total_requests", "Total number of requests processed"
+            )
+            self.prometheus_metrics["total_successes"] = PromCounter(
+                "vllm_total_successes", "Total number of successful requests"
+            )
+            self.prometheus_metrics["total_failures"] = PromCounter(
+                "vllm_total_failures", "Total number of failed requests"
+            )
+            self.prometheus_metrics["total_tokens_input"] = PromCounter(
+                "vllm_total_tokens_input", "Total number of input tokens processed"
+            )
+            self.prometheus_metrics["total_tokens_output"] = PromCounter(
+                "vllm_total_tokens_output", "Total number of output tokens generated"
+            )
 
-        # 히스토그램 지표
-        self.prometheus_metrics["request_latency"] = Histogram(
-            "vllm_request_latency_seconds", "Request latency in seconds",
-            buckets=(0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0)
-        )
-        self.prometheus_metrics["tokens_per_second"] = Histogram(
-            "vllm_tokens_per_second", "Tokens generated per second",
-            buckets=(1, 5, 10, 20, 50, 100, 200, 500)
-        )
+            # 게이지 지표
+            self.prometheus_metrics["active_requests"] = Gauge(
+                "vllm_active_requests", "Number of currently active requests"
+            )
 
-        # 시스템 메트릭
-        self.prometheus_metrics["cpu_percent"] = Gauge(
-            "vllm_cpu_percent", "CPU utilization percentage"
-        )
-        self.prometheus_metrics["ram_percent"] = Gauge(
-            "vllm_ram_percent", "RAM utilization percentage"
-        )
-        self.prometheus_metrics["gpu_memory_percent"] = Gauge(
-            "vllm_gpu_memory_percent", "GPU memory utilization percentage",
-            ["gpu_id"]
-        )
-        self.prometheus_metrics["gpu_utilization"] = Gauge(
-            "vllm_gpu_utilization", "GPU utilization percentage",
-            ["gpu_id"]
-        )
+            # 히스토그램 지표
+            self.prometheus_metrics["request_latency"] = Histogram(
+                "vllm_request_latency_seconds", "Request latency in seconds",
+                buckets=(0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0)
+            )
+            self.prometheus_metrics["tokens_per_second"] = Histogram(
+                "vllm_tokens_per_second", "Tokens generated per second",
+                buckets=(1, 5, 10, 20, 50, 100, 200, 500)
+            )
+
+            # 시스템 메트릭
+            self.prometheus_metrics["cpu_percent"] = Gauge(
+                "vllm_cpu_percent", "CPU utilization percentage"
+            )
+            self.prometheus_metrics["ram_percent"] = Gauge(
+                "vllm_ram_percent", "RAM utilization percentage"
+            )
+            self.prometheus_metrics["gpu_memory_percent"] = Gauge(
+                "vllm_gpu_memory_percent", "GPU memory utilization percentage",
+                ["gpu_id"]
+            )
+            self.prometheus_metrics["gpu_utilization"] = Gauge(
+                "vllm_gpu_utilization", "GPU utilization percentage",
+                ["gpu_id"]
+            )
+
+            # 성공적으로 초기화되었음을 표시
+            self._metrics_initialized = True
+            logger.info("Prometheus metrics successfully initialized")
+
+        except ValueError as e:
+            # 중복 등록 오류 처리
+            if "Duplicated timeseries" in str(e):
+                logger.warning(f"Prometheus metrics already registered: {str(e)}")
+                self._metrics_initialized = True
+                # 이미 등록된 메트릭 사용하기 위한 방법 (선택적)
+                from prometheus_client import REGISTRY
+                for metric in REGISTRY.collect():
+                    if metric.name.startswith("vllm_"):
+                        name = metric.name
+                        if name.endswith("_total"):
+                            name = name[:-6]  # "_total" 접미사 제거
+                        if name not in self.prometheus_metrics:
+                            self.prometheus_metrics[name] = metric
+            else:
+                # 다른 오류는 그대로 발생시킴
+                logger.error(f"Error initializing Prometheus metrics: {str(e)}")
+                raise
 
     def start_collection(self) -> None:
         """메트릭 수집 스레드 시작"""

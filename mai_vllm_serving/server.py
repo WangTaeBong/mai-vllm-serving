@@ -333,7 +333,7 @@ async def generate(request: GenerationRequest, background_tasks: BackgroundTasks
                 frequency_penalty=request.frequency_penalty,
                 presence_penalty=request.presence_penalty,
                 repetition_penalty=request.repetition_penalty,
-                no_repeat_ngram_size=request.no_repeat_ngram_size,
+                # no_repeat_ngram_size=request.no_repeat_ngram_size,
                 stop=request.stop,
                 stream=request.stream,
                 request_id=request_id,

@@ -184,6 +184,22 @@ class DistributedVLLMEngine:
         # 분산 동기화
         self._sync_distributed()
 
+    @classmethod
+    def shutdown(cls):
+        """분산 엔진 종료 및 리소스 정리"""
+        if dist.is_initialized():
+            logger.info("분산 환경 종료 중...")
+            try:
+                # 모든 분산 작업이 완료될 때까지 대기
+                dist.barrier()
+
+                # 프로세스 그룹 정리 추가 - 이 부분이 없거나 적절히 호출되지 않았을 수 있음
+                dist.destroy_process_group()
+
+                logger.info("분산 환경이 정상적으로 종료되었습니다")
+            except Exception as e:
+                logger.error(f"분산 환경 종료 중 오류 발생: {str(e)}", exc_info=True)
+
     def _validate_and_set_defaults(self,
                                    tensor_parallel_size, pipeline_parallel_size,
                                    gpu_memory_utilization, max_model_len, max_num_seqs,

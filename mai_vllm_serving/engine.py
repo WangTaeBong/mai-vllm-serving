@@ -48,7 +48,7 @@ class RequestConfig:
     frequency_penalty: float = config.inference.frequency_penalty
     presence_penalty: float = config.inference.presence_penalty
     repetition_penalty: float = config.inference.repetition_penalty
-    no_repeat_ngram_size: int = config.inference.no_repeat_ngram_size
+    # no_repeat_ngram_size: int = config.inference.no_repeat_ngram_size
     stop: Optional[Union[str, List[str]]] = None
     stream: bool = False
     request_id: Optional[str] = None
@@ -71,8 +71,8 @@ class RequestConfig:
             repetition_penalty=self.repetition_penalty,
             stop=self.stop,
             seed=self.seed,
-            ignore_eos=False,
-            no_repeat_ngram_size=self.no_repeat_ngram_size
+            ignore_eos=False
+            # no_repeat_ngram_size=self.no_repeat_ngram_size
         )
 
 
@@ -291,7 +291,7 @@ class MAIVLLMEngine:
                         frequency_penalty=req_config.frequency_penalty if req_config.frequency_penalty is not None else config.inference.frequency_penalty,
                         presence_penalty=req_config.presence_penalty if req_config.presence_penalty is not None else config.inference.presence_penalty,
                         repetition_penalty=req_config.repetition_penalty if req_config.repetition_penalty is not None else config.inference.repetition_penalty,
-                        no_repeat_ngram_size=req_config.no_repeat_ngram_size if req_config.no_repeat_ngram_size is not None else config.inference.no_repeat_ngram_size,
+                        # no_repeat_ngram_size=req_config.no_repeat_ngram_size if req_config.no_repeat_ngram_size is not None else config.inference.no_repeat_ngram_size,
                         stop=req_config.stop,
                         stream=req_config.stream,
                         request_id=req_config.request_id,
