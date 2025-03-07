@@ -1,0 +1,95 @@
+# mai-vllm-serving 기본 설정 파일
+
+# 서버 설정
+server:
+  host: "0.0.0.0"            # 서버 호스트 주소
+  port: 8020                 # 서버 포트
+  workers: 2                 # L40s 2개에 적합
+  log_level: "info"          # 로깅 레벨 (debug, info, warning, error, critical)
+  request_timeout: 600       # 요청 타임아웃 (초)
+  cors_origins: ["*"]        # CORS 허용 도메인
+  max_batch_size: 16         # 최대 배치 크기
+
+# 모델 설정
+model:
+  name: "./models/AI-Korean-Mistral-Nemo-sft-dpo-12B"  # 로컬 모델 경로
+  revision: "main"          # 모델 리비전
+  cache_dir: "./models"     # 모델 캐시 디렉토리
+  download_dir: "./models"  # 모델 다운로드 디렉토리
+  trust_remote_code: true   # 원격 코드 신뢰 여부
+
+# vLLM 엔진 설정
+engine:
+  tensor_parallel_size: 2     # L40s 2개 사용
+  pipeline_parallel_size: 1   # 파이프라인 병렬 처리에 사용할 GPU 수
+  gpu_memory_utilization: 0.90  # L40s의 메모리 활용도 최적화
+  max_model_len: 131072
+  max_num_seqs: 64           # 다중 언어 처리 및 코딩을 위해 배치 크기 조정
+  max_num_batched_tokens: 32768  # 큰 컨텍스트 윈도우 활용 (128K)
+  block_size: 64             # KV 캐시 블록 크기 증가 (긴 컨텍스트용)
+  swap_space: 16             # CPU 스왑 공간 크기 (GB)
+  enforce_eager: false       # PyTorch eager 모드 강제 실행 여부
+  disable_log_stats: false   # 통계 로깅 비활성화 여부
+  dtype: "bfloat16"          # config.json과 일치하는 데이터 타입
+  sliding_window: null       # config.json과 일치시킴
+
+# 양자화 설정
+quantization:
+  enabled: false             # 기본적으로 비활성화
+  method: "awq"              # 양자화 방식 (null, awq, gptq, squeezellm)
+  bits: 4                    # 양자화 비트 수 (4, 8)
+  group_size: 128            # 양자화 그룹 크기
+  zero_point: true           # 제로 포인트 사용 여부
+
+# 분산 처리 설정
+distributed:
+  world_size: 1              # 분산 처리에 참여하는 총 프로세스 수
+  backend: "nccl"            # 분산 통신 백엔드 (nccl: GPU, gloo: CPU)
+  master_addr: "localhost"   # 마스터 프로세스의 주소
+  master_port: "29500"       # 마스터 프로세스의 포트
+  timeout: 1800              # 분산 통신 타임아웃 (초)
+
+# 토크나이저 설정
+tokenizer:
+  trust_remote_code: true    # 원격 코드 신뢰 여부
+  padding_side: "left"       # 패딩 방향 (left, right)
+  truncation_side: "right"   # 잘라내기 방향 (left, right)
+  legacy: false              # 레거시 모드 사용 여부
+
+# 추론 기본 설정
+inference:
+  max_tokens: 2048           # 생성할 최대 토큰 수
+  temperature: 0.7           # 샘플링 온도 (0.0 ~ 2.0)
+  top_p: 0.95                # 누적 확률 임계값 (0.0 ~ 1.0)
+  top_k: 50                  # 샘플링할 최상위 토큰 수
+  frequency_penalty: 0.0     # 빈도 페널티 (0.0 ~ 2.0)
+  presence_penalty: 0.0      # 존재 페널티 (0.0 ~ 2.0)
+  repetition_penalty: 1.05   # 반복 페널티 (1.0 ~ 2.0)
+  no_repeat_ngram_size: 4    # 반복하지 않을 n-gram 크기
+  seed: 42                   # 랜덤 시드 (null: 랜덤)
+
+# 모니터링 설정
+monitoring:
+  enabled: true              # 모니터링 활성화 여부
+  metrics_port: 8001         # 메트릭 서버 포트
+  log_stats_interval: 10     # 통계 로깅 간격 (초)
+  profile_interval: 60       # 프로파일링 간격 (초)
+  prometheus: true           # Prometheus 메트릭 활성화 여부
+  record_latency: true       # 지연 시간 기록 여부
+  record_memory: true        # 메모리 사용량 기록 여부
+
+# 캐싱 설정
+caching:
+  enabled: true              # 캐싱 활성화 여부
+  prompt_cache_size: 1000    # 프롬프트 캐시 크기
+  result_cache_size: 1000    # 결과 캐시 크기
+  ttl: 3600                  # 캐시 항목 수명 (초)
+
+# 로깅 설정
+logging:
+  level: "info"              # 로깅 레벨
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"  # 로그 형식
+  file: "./logs/mai-vllm-serving.log"  # 로그 파일 경로
+  json: false                 # JSON 형식 로깅 활성화
+  log_requests: true         # 요청 로깅 여부
+  log_responses: true        # 응답 로깅 여부
