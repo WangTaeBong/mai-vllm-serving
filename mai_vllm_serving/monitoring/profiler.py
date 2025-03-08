@@ -723,6 +723,10 @@ def get_profiler() -> SystemProfiler:
     """
     global _active_profiler
 
+    # 모니터링이 비활성화된 경우 더미 프로파일러 반환
+    if not config.monitoring.enabled:
+        return _get_dummy_profiler()
+
     if _active_profiler is None:
         # 설정에서 프로파일링 설정 가져오기
         local_profiler_config = ProfilerConfig(
@@ -741,6 +745,32 @@ def get_profiler() -> SystemProfiler:
     return _active_profiler
 
 
+# 더미 프로파일러 생성 함수 추가
+def _get_dummy_profiler():
+    """모니터링 비활성화 상태에서 사용할 더미 프로파일러 생성"""
+    if not hasattr(get_profiler, '_dummy_profiler'):
+        class DummyProfiler:
+            def __init__(self):
+                self.config = ProfilerConfig(enabled=False)
+
+            def profile_function(self, func):
+                return func
+
+            async def get_memory_report(self):
+                return {"status": "profiling_disabled"}
+
+            async def get_function_stats(self, *args, **kwargs):
+                return {"status": "profiling_disabled"}
+
+            def start(self): pass
+
+            def stop(self): pass
+
+        get_profiler._dummy_profiler = DummyProfiler()
+
+    return get_profiler._dummy_profiler
+
+
 def profile(func_):
     """
     함수 프로파일링 데코레이터
@@ -751,6 +781,10 @@ def profile(func_):
     Returns:
         프로파일링이 적용된 함수
     """
+    # 모니터링이 비활성화된 경우 원본 함수 그대로 반환
+    if not config.monitoring.enabled:
+        return func_
+
     return get_profiler().profile_function(func_)
 
 
@@ -763,6 +797,11 @@ def profile_block(name: str):
     Args:
         name: 프로파일링 블록 이름
     """
+    # 모니터링이 비활성화된 경우 빈 컨텍스트 반환
+    if not config.monitoring.enabled:
+        yield
+        return
+
     profiler_ = get_profiler()
     if not profiler_.config.enabled:
         yield

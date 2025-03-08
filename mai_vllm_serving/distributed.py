@@ -484,11 +484,13 @@ class DistributedVLLMEngine:
             }
 
         # 메트릭 수집기 가져오기 (마스터 노드에서만 메트릭 수집)
-        metrics_collector = get_metrics_collector() if self.is_master else None
-
-        # 마스터 노드의 경우 메트릭 수집 시작
-        if self.is_master and metrics_collector:
-            metrics_collector.start_request(request_id)
+        metrics_collector = None
+        if config.monitoring.enabled:
+            metrics_collector = get_metrics_collector() if self.is_master else None
+            # 요청 처리 시작 기록
+            # 마스터 노드의 경우 메트릭 수집 시작
+            if self.is_master and metrics_collector:
+                metrics_collector.start_request(request_id)
 
         # 추론 시작 로깅
         logger.info(f"Request {request_id} received: prompt length={len(req_config.prompt)}, "
@@ -559,12 +561,13 @@ class DistributedVLLMEngine:
                 })
 
             # 마스터 노드의 경우 메트릭 수집기에 완료 기록
-            if self.is_master and metrics_collector:
-                metrics_collector.complete_request(
-                    request_id,
-                    completion_tokens=completion_tokens,
-                    prompt_tokens=prompt_tokens
-                )
+            if config.monitoring.enabled:
+                if self.is_master and metrics_collector:
+                    metrics_collector.complete_request(
+                        request_id,
+                        completion_tokens=completion_tokens,
+                        prompt_tokens=prompt_tokens
+                    )
 
             # 통계 로깅
             if self.is_master:

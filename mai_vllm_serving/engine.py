@@ -6,6 +6,7 @@ vLLM 엔진의 성능과 안정성을 최적화하기 위한 래퍼 클래스
 import logging
 import time
 import uuid
+import contextlib
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union, Any, AsyncIterator, AsyncGenerator
 
@@ -255,11 +256,12 @@ class MAIVLLMEngine:
         if req_config.request_id is None:
             req_config.request_id = str(uuid.uuid4())
 
-        # 메트릭 수집기 가져오기
-        metrics_collector = get_metrics_collector()
-
-        # 요청 처리 시작 기록 (프롬프트 토큰 수는 아직 모름)
-        metrics_collector.start_request(req_config.request_id)
+        # 메트릭 수집기 가져오기 - 모니터링이 활성화된 경우에만
+        metrics_collector = None
+        if config.monitoring.enabled:
+            metrics_collector = get_metrics_collector()
+            # 요청 처리 시작 기록
+            metrics_collector.start_request(req_config.request_id)
 
         # 추론 시작 로깅
         logger.info(f"Request {req_config.request_id} received: prompt length={len(req_config.prompt)}, "
@@ -318,19 +320,22 @@ class MAIVLLMEngine:
                 if result is None:
                     err_msg = f"No result generated for request {req_config.request_id}"
                     logger.error(err_msg)
-                    metrics_collector.fail_request(req_config.request_id, err_msg)
+                    # 모니터링이 활성화된 경우에만 메트릭 업데이트
+                    if config.monitoring.enabled and metrics_collector:
+                        metrics_collector.fail_request(req_config.request_id, err_msg)
                     raise RuntimeError(err_msg)
 
                 # 결과 파싱 및 통계 업데이트
                 output = result.outputs[0]
                 stats = self._update_stats(req_config.request_id, result, timing)
 
-                # 메트릭 수집기에 완료 기록
-                metrics_collector.complete_request(
-                    req_config.request_id,
-                    completion_tokens=len(output.token_ids),
-                    prompt_tokens=len(result.prompt_token_ids)
-                )
+                # 메트릭 수집기에 완료 기록 - 모니터링이 활성화된 경우에만
+                if config.monitoring.enabled and metrics_collector:
+                    metrics_collector.complete_request(
+                        req_config.request_id,
+                        completion_tokens=len(output.token_ids),
+                        prompt_tokens=len(result.prompt_token_ids)
+                    )
 
                 # 로깅
                 logger.info(
@@ -356,8 +361,9 @@ class MAIVLLMEngine:
 
             except Exception as e:
                 logger.error(f"Error processing request {req_config.request_id}: {str(e)}", exc_info=True)
-                # 메트릭 수집기에 실패 기록
-                metrics_collector.fail_request(req_config.request_id, str(e))
+                # 메트릭 수집기에 실패 기록 - 모니터링이 활성화된 경우에만
+                if config.monitoring.enabled and metrics_collector:
+                    metrics_collector.fail_request(req_config.request_id, str(e))
                 raise
 
             finally:
@@ -380,7 +386,8 @@ class MAIVLLMEngine:
         Yields:
             생성된 텍스트 조각
         """
-        if metrics_collector is None:
+        # 메트릭 수집기 확인 - 모니터링이 활성화된 경우에만
+        if metrics_collector is None and config.monitoring.enabled:
             metrics_collector = get_metrics_collector()
 
         request_id = engine_request.request_id
@@ -450,8 +457,8 @@ class MAIVLLMEngine:
                     # MAIVLLMEngine은 _request_lock을 사용하지 않으므로 직접 _update_stats 호출
                     self._update_stats(engine_request.request_id, result, timing)
 
-                    # 메트릭 수집기에 완료 기록
-                    if metrics_collector:
+                    # 메트릭 수집기에 완료 기록 - 모니터링이 활성화된 경우에만
+                    if config.monitoring.enabled and metrics_collector:
                         metrics_collector.complete_request(
                             request_id,
                             completion_tokens=tokens_generated,
@@ -472,8 +479,8 @@ class MAIVLLMEngine:
             if request_id in self.inference_stats:
                 self.inference_stats[request_id].end_time = time.time()
 
-            # 메트릭 수집기에 실패 기록
-            if metrics_collector:
+            # 메트릭 수집기에 실패 기록 - 모니터링이 활성화된 경우에만
+            if config.monitoring.enabled and metrics_collector:
                 metrics_collector.fail_request(request_id, str(e))
 
             # 오류 정보 반환
@@ -557,13 +564,14 @@ class MAIVLLMEngine:
         uptime = time.time() - self.start_time
         tokens_per_second = self.total_tokens_generated / uptime if uptime > 0 else 0
 
-        # 메트릭 수집기에서 추가 정보 가져오기
-        try:
-            metrics_collector = get_metrics_collector()
-            metrics_info = metrics_collector.get_metrics()
-        except Exception as e:
-            logger.warning(f"Failed to get metrics from collector: {str(e)}")
-            metrics_info = {}
+        # 메트릭 수집기에서 추가 정보 가져오기 - 모니터링이 활성화된 경우에만
+        metrics_info = {}
+        if config.monitoring.enabled:
+            try:
+                metrics_collector = get_metrics_collector()
+                metrics_info = metrics_collector.get_metrics()
+            except Exception as e:
+                logger.warning(f"Failed to get metrics from collector: {str(e)}")
 
         # 기본 통계 정보
         stats = {
@@ -588,30 +596,31 @@ class MAIVLLMEngine:
                 "avg_request_time": metrics_info.get("avg_request_time", 0)
             }
 
-        # 프로파일링 정보 추가
-        try:
-            profiler = get_profiler()
-            memory_report = profiler.get_memory_report()
-            function_stats = profiler.get_function_stats(top_n=5)  # 상위 5개 함수만
+        # 프로파일링 정보 추가 - 모니터링이 활성화된 경우에만
+        if config.monitoring.enabled:
+            try:
+                profiler = get_profiler()
+                memory_report = profiler.get_memory_report()
+                function_stats = profiler.get_function_stats(top_n=5)  # 상위 5개 함수만
 
-            memory_data = await memory_report
-            function_data = await function_stats
+                memory_data = await memory_report
+                function_data = await function_stats
 
-            stats["profiling"] = {
-                "memory": {
-                    "process_ram_gb": await memory_data["current"]["process_ram_used_gb"],
-                    "system_ram_percent": await memory_data["current"]["system_ram_percent"]
-                },
-                "top_functions": [
-                    {
-                        "name": f"{func['module_name']}.{func['function_name']}",
-                        "avg_time": func["avg_time"],
-                        "call_count": func["call_count"]
-                    } for func in function_data.get("top_functions", [])[:5]
-                ]
-            }
-        except Exception as e:
-            logger.warning(f"Failed to get profiling stats: {str(e)}")
+                stats["profiling"] = {
+                    "memory": {
+                        "process_ram_gb": await memory_data["current"]["process_ram_used_gb"],
+                        "system_ram_percent": await memory_data["current"]["system_ram_percent"]
+                    },
+                    "top_functions": [
+                        {
+                            "name": f"{func['module_name']}.{func['function_name']}",
+                            "avg_time": func["avg_time"],
+                            "call_count": func["call_count"]
+                        } for func in function_data.get("top_functions", [])[:5]
+                    ]
+                }
+            except Exception as e:
+                logger.warning(f"Failed to get profiling stats: {str(e)}")
 
         return stats
 

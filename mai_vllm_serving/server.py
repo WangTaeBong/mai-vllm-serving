@@ -204,14 +204,15 @@ async def lifespan(app_: FastAPI):
                 EngineManager.set_instance(llm_engine)
                 logger.info(f"Engine initialized in {timing.duration:.2f} seconds")
 
-        # 모니터링 시스템 초기화
-        if config.monitoring.enabled:
+        # 모니터링 시스템 초기화 (enabled 체크는 함수 내부에서 수행)
+        monitor_enabled = config.monitoring.enabled
+        if monitor_enabled:
             init_monitoring()
             # 프로파일링 시스템 초기화
             init_profiling()
             logger.info("Monitoring and profiling systems initialized")
-
-        logger.info("mai-vllm-serving is ready to process requests")
+        else:
+            logger.info("Monitoring and profiling systems are disabled")
 
     except Exception as e:
         logger.error(f"Failed to initialize LLM engine: {str(e)}", exc_info=True)
@@ -292,7 +293,7 @@ async def add_utf8_header(request: Request, call_next):
 async def metrics():
     """서버 메트릭 정보 반환"""
     if not config.monitoring.enabled:
-        return {"status": "monitoring_disabled"}
+        return {"status": "monitoring_disabled", "message": "Monitoring is disabled in configuration"}
 
     try:
         metrics_data = await get_current_metrics()
@@ -307,7 +308,7 @@ async def metrics():
 async def profiling_metrics():
     """프로파일링 메트릭 정보 반환"""
     if not config.monitoring.enabled:
-        return {"status": "monitoring_disabled"}
+        return {"status": "monitoring_disabled", "message": "Monitoring is disabled in configuration"}
 
     try:
         profiler = get_profiler()
@@ -325,7 +326,7 @@ async def profiling_metrics():
 async def request_metrics(request_id: str):
     """특정 요청의 메트릭 정보 반환"""
     if not config.monitoring.enabled:
-        return {"status": "monitoring_disabled"}
+        return {"status": "monitoring_disabled", "message": "Monitoring is disabled in configuration"}
 
     try:
         metrics_data = await get_request_metrics_by_id(request_id)

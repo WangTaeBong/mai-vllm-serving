@@ -636,6 +636,10 @@ def get_metrics_collector() -> MetricsCollector:
     """
     global _metrics_collector
 
+    # 모니터링이 비활성화된 경우 가벼운 더미 컬렉터 반환 고려
+    if not config.monitoring.enabled:
+        return _create_dummy_collector()
+
     if _metrics_collector is None:
         _metrics_collector = MetricsCollector(
             max_history=config.monitoring.log_stats_interval * 10,
@@ -646,6 +650,34 @@ def get_metrics_collector() -> MetricsCollector:
         _metrics_collector.start_collection()
 
     return _metrics_collector
+
+
+# 더미 컬렉터 생성 함수 추가
+def _create_dummy_collector():
+    """모니터링 비활성화 상태에서 사용할 더미 컬렉터 생성"""
+    global _dummy_collector
+
+    if not hasattr(get_metrics_collector, '_dummy_collector'):
+        class DummyCollector:
+            def start_request(self, *args, **kwargs): pass
+
+            def start_processing(self, *args, **kwargs): pass
+
+            def complete_request(self, *args, **kwargs): pass
+
+            def fail_request(self, *args, **kwargs): pass
+
+            def get_metrics(self): return {"status": "monitoring_disabled"}
+
+            def get_request_metrics(self, *args): return None
+
+            def start_collection(self): pass
+
+            def stop_collection(self): pass
+
+        get_metrics_collector._dummy_collector = DummyCollector()
+
+    return get_metrics_collector._dummy_collector
 
 
 def track_request(func):
@@ -663,6 +695,10 @@ def track_request(func):
 
     @functools.wraps(func)
     async def wrapper(*args, **kwargs):
+        # 모니터링이 비활성화된 경우 원본 함수만 실행
+        if not config.monitoring.enabled:
+            return await func(*args, **kwargs)
+
         # 요청 ID 생성
         request_id = str(uuid.uuid4())
 
