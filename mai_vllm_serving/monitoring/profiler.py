@@ -1,5 +1,5 @@
 """
-mai-vllm-serving 성능 프로파일링 모듈
+리팩토링된 mai-vllm-serving 성능 프로파일링 모듈
 시스템 성능 측정 및 분석을 위한 상세 프로파일링 기능 제공
 """
 import asyncio
@@ -8,50 +8,38 @@ import functools
 import gc
 import json
 import logging
+import os
 import threading
 import time
-import os
-from datetime import datetime
 from dataclasses import dataclass, field, asdict
+from datetime import datetime
 from typing import Dict, List, Optional, Any, Callable, cast
 
 import psutil
+import py3nvml.py3nvml as nvml
 import torch
-
-try:
-    import torch.profiler as torch_profiler
-
-    HAS_TORCH_PROFILER = True
-except ImportError:
-    torch_profiler = None
-    HAS_TORCH_PROFILER = False
-
-try:
-    import GPUtil
-
-    HAS_GPUTIL = True
-except ImportError:
-    HAS_GPUTIL = False
-
-try:
-    import memory_profiler
-
-    HAS_MEMORY_PROFILER = True
-except ImportError:
-    HAS_MEMORY_PROFILER = False
-
-try:
-    import py3nvml
-    import py3nvml.py3nvml as nvml
-
-    HAS_NVML = True
-except ImportError:
-    nvml = None
-    HAS_NVML = False
+import torch.profiler as torch_profiler
 
 # 설정 모듈 임포트
 from mai_vllm_serving.utils.config import get_config
 from mai_vllm_serving.utils.logging_utils import setup_logging
+
+# 의존성 관리 개선: 버전 명시 및 그룹화
+REQUIRED_PACKAGES = {
+    "torch": {"min_version": "1.10.0", "recommended": "2.0.0"},
+    "psutil": {"min_version": "5.8.0", "recommended": "5.9.0"}
+}
+
+# 선택적 의존성 관리 개선
+OPTIONAL_PACKAGES = {
+    "torch_profiler": {"module": "torch.profiler", "version": None},
+    "gputil": {"module": "GPUtil", "version": "1.4.0"},
+    "memory_profiler": {"module": "memory_profiler", "version": "0.60.0"},
+    "nvml": {"module": "py3nvml.py3nvml", "version": "0.2.7"}
+}
+
+# 의존성 가져오기 및 상태 추적
+PACKAGE_STATUS = {}
 
 # 로깅 설정
 config = get_config()
@@ -90,6 +78,57 @@ class FunctionProfile:
 
 
 @dataclass
+class GPUInfo:
+    """GPU 정보"""
+    id: int
+    name: str
+    memory_allocated_gb: float = 0.0
+    memory_reserved_gb: float = 0.0
+    memory_cached_gb: float = 0.0
+    total_memory_gb: float = 0.0
+    used_memory_gb: float = 0.0
+    free_memory_gb: float = 0.0
+    gpu_utilization: float = 0.0
+    memory_utilization: float = 0.0
+    temperature: float = 0.0
+
+    @classmethod
+    def collect_gpu_info(cls, idx: int) -> 'GPUInfo':
+        """특정 GPU의 정보 수집"""
+        gpu_info = cls(
+            id=idx,
+            name=torch.cuda.get_device_name(idx),
+            memory_allocated_gb=torch.cuda.memory_allocated(idx) / (1024 ** 3),
+            memory_reserved_gb=torch.cuda.memory_reserved(idx) / (1024 ** 3),
+            memory_cached_gb=torch.cuda.memory_reserved(idx) / (1024 ** 3) if hasattr(torch.cuda,
+                                                                                      'memory_reserved') else 0
+        )
+
+        # NVML 정보 추가 (가능한 경우)
+        if PACKAGE_STATUS["nvml"]:
+            try:
+                nvml.nvmlInit()
+                handle = nvml.nvmlDeviceGetHandleByIndex(idx)
+                info = nvml.nvmlDeviceGetMemoryInfo(handle)
+                gpu_info.total_memory_gb = info.total / (1024 ** 3)
+                gpu_info.used_memory_gb = info.used / (1024 ** 3)
+                gpu_info.free_memory_gb = info.free / (1024 ** 3)
+
+                # GPU 사용률
+                util = nvml.nvmlDeviceGetUtilizationRates(handle)
+                gpu_info.gpu_utilization = util.gpu
+                gpu_info.memory_utilization = util.memory
+
+                # 온도
+                gpu_info.temperature = nvml.nvmlDeviceGetTemperature(handle, nvml.NVML_TEMPERATURE_GPU)
+                nvml.nvmlShutdown()
+            except Exception as err:
+                logger.debug(f"NVML error: {str(err)}")
+
+        return gpu_info
+
+
+@dataclass
 class MemorySnapshot:
     """메모리 사용 스냅샷"""
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
@@ -98,7 +137,7 @@ class MemorySnapshot:
     system_ram_percent: float = 0.0
     process_ram_used_gb: float = 0.0
     python_objects: Dict[str, int] = field(default_factory=dict)
-    gpu_memory: List[Dict[str, Any]] = field(default_factory=list)
+    gpu_memory: List[GPUInfo] = field(default_factory=list)
 
     @staticmethod
     def capture() -> 'MemorySnapshot':
@@ -110,67 +149,54 @@ class MemorySnapshot:
         """
         snapshot = MemorySnapshot()
 
-        # 시스템 RAM 정보
-        mem = psutil.virtual_memory()
-        snapshot.system_ram_used_gb = mem.used / (1024 ** 3)
-        snapshot.system_ram_total_gb = mem.total / (1024 ** 3)
-        snapshot.system_ram_percent = mem.percent
+        # 시스템 RAM 정보 수집
+        snapshot._collect_system_ram_info()
 
-        # 현재 프로세스 메모리 사용량
-        pid = os.getpid()
-        process = psutil.Process(pid)
-        snapshot.process_ram_used_gb = process.memory_info().rss / (1024 ** 3)
+        # 프로세스 메모리 정보 수집
+        snapshot._collect_process_info()
 
-        # Python 객체 카운트
-        if HAS_MEMORY_PROFILER:
-            objects = {}
-            for obj in gc.get_objects():
-                obj_type = type(obj).__name__
-                if obj_type in objects:
-                    objects[obj_type] += 1
-                else:
-                    objects[obj_type] = 1
+        # Python 객체 정보 수집 (memory_profiler 필요)
+        if PACKAGE_STATUS["memory_profiler"]:
+            snapshot._collect_python_objects()
 
-            # 가장 많은 객체 타입 상위 20개만 저장
-            snapshot.python_objects = dict(
-                sorted(objects.items(), key=lambda x: x[1], reverse=True)[:20]
-            )
-
-        # GPU 메모리 정보
+        # GPU 메모리 정보 수집
         if torch.cuda.is_available():
-            for idx in range(torch.cuda.device_count()):
-                gpu_info = {
-                    "id": idx,
-                    "name": torch.cuda.get_device_name(idx),
-                    "memory_allocated_gb": torch.cuda.memory_allocated(idx) / (1024 ** 3),
-                    "memory_reserved_gb": torch.cuda.memory_reserved(idx) / (1024 ** 3),
-                    "memory_cached_gb": torch.cuda.memory_reserved(idx) / (1024 ** 3) if hasattr(torch.cuda,
-                                                                                                 'memory_reserved') else 0
-                }
-
-                if HAS_NVML:
-                    try:
-                        nvml.nvmlInit()
-                        handle = nvml.nvmlDeviceGetHandleByIndex(idx)
-                        info = nvml.nvmlDeviceGetMemoryInfo(handle)
-                        gpu_info["total_memory_gb"] = info.total / (1024 ** 3)
-                        gpu_info["used_memory_gb"] = info.used / (1024 ** 3)
-                        gpu_info["free_memory_gb"] = info.free / (1024 ** 3)
-
-                        # GPU 사용률
-                        util = nvml.nvmlDeviceGetUtilizationRates(handle)
-                        gpu_info["gpu_utilization"] = util.gpu
-                        gpu_info["memory_utilization"] = util.memory
-
-                        # 온도
-                        gpu_info["temperature"] = nvml.nvmlDeviceGetTemperature(handle, nvml.NVML_TEMPERATURE_GPU)
-                        nvml.nvmlShutdown()
-                    except Exception as err:
-                        logger.debug(f"NVML error: {str(err)}")
-
-                snapshot.gpu_memory.append(gpu_info)
+            snapshot._collect_gpu_info()
 
         return snapshot
+
+    def _collect_system_ram_info(self) -> None:
+        """시스템 RAM 정보 수집"""
+        mem = psutil.virtual_memory()
+        self.system_ram_used_gb = mem.used / (1024 ** 3)
+        self.system_ram_total_gb = mem.total / (1024 ** 3)
+        self.system_ram_percent = mem.percent
+
+    def _collect_process_info(self) -> None:
+        """현재 프로세스 메모리 정보 수집"""
+        pid = os.getpid()
+        process = psutil.Process(pid)
+        self.process_ram_used_gb = process.memory_info().rss / (1024 ** 3)
+
+    def _collect_python_objects(self) -> None:
+        """Python 객체 카운트 수집"""
+        objects = {}
+        for obj in gc.get_objects():
+            obj_type = type(obj).__name__
+            if obj_type in objects:
+                objects[obj_type] += 1
+            else:
+                objects[obj_type] = 1
+
+        # 가장 많은 객체 타입 상위 20개만 저장
+        self.python_objects = dict(
+            sorted(objects.items(), key=lambda x: x[1], reverse=True)[:20]
+        )
+
+    def _collect_gpu_info(self) -> None:
+        """GPU 메모리 정보 수집"""
+        for idx in range(torch.cuda.device_count()):
+            self.gpu_memory.append(GPUInfo.collect_gpu_info(idx))
 
 
 @dataclass
@@ -283,39 +309,51 @@ class SystemProfiler:
 
         # 메모리 스냅샷 생성
         if self.config.memory_profiling:
-            try:
-                memory_snapshot = MemorySnapshot.capture()
-                self.memory_snapshots.append(memory_snapshot)
-
-                # 최대 100개만 유지
-                if len(self.memory_snapshots) > 100:
-                    self.memory_snapshots.pop(0)
-
-                if self.config.verbose:
-                    logger.info(f"Memory snapshot: Process RAM: {memory_snapshot.process_ram_used_gb:.2f} GB, "
-                                f"System RAM: {memory_snapshot.system_ram_percent:.1f}%")
-            except Exception as err:
-                logger.error(f"Error capturing memory snapshot: {str(err)}", exc_info=True)
+            self._capture_memory_snapshot()
 
         # PyTorch 프로파일링
-        if self.config.torch_profiling and HAS_TORCH_PROFILER and torch.cuda.is_available():
-            try:
-                self._profile_torch_operations()
-            except Exception as err:
-                logger.error(f"Error in PyTorch profiling: {str(err)}", exc_info=True)
+        if self.config.torch_profiling and PACKAGE_STATUS["torch_profiler"] and torch.cuda.is_available():
+            self._profile_torch_operations()
 
         # 프로파일 결과 저장
         if self.config.log_to_file:
             self._save_profile_results()
 
+    def _capture_memory_snapshot(self) -> None:
+        """메모리 스냅샷 캡처"""
+        try:
+            memory_snapshot = MemorySnapshot.capture()
+            self.memory_snapshots.append(memory_snapshot)
+
+            # 최대 100개만 유지
+            if len(self.memory_snapshots) > 100:
+                self.memory_snapshots.pop(0)
+
+            if self.config.verbose:
+                logger.info(f"Memory snapshot: Process RAM: {memory_snapshot.process_ram_used_gb:.2f} GB, "
+                            f"System RAM: {memory_snapshot.system_ram_percent:.1f}%")
+        except Exception as err:
+            logger.error(f"Error capturing memory snapshot: {str(err)}", exc_info=True)
+
     def _profile_torch_operations(self) -> None:
         """PyTorch 연산 프로파일링"""
-        if not HAS_TORCH_PROFILER:
+        if not PACKAGE_STATUS["torch_profiler"]:
             return
 
         logger.debug("Starting PyTorch operations profiling")
 
         # 이전 세션 종료
+        self._close_torch_profiler_session()
+
+        # 새 프로파일링 세션 시작
+        try:
+            self._start_torch_profiler_session()
+        except Exception as err:
+            logger.error(f"Failed to start PyTorch profiling: {str(err)}", exc_info=True)
+            self.torch_profiler_session = None
+
+    def _close_torch_profiler_session(self) -> None:
+        """PyTorch 프로파일러 세션 종료"""
         if self.torch_profiler_session is not None:
             try:
                 self.torch_profiler_session.__exit__(None, None, None)
@@ -324,32 +362,28 @@ class SystemProfiler:
                 # 프로파일러 세션 종료는 실패해도 프로그램 동작에 영향을 주지 않으므로 무시
                 pass
 
-        # 새 프로파일링 세션 시작
-        try:
-            profile_path = os.path.join(self.config.profile_dir, f"torch_profile_{int(time.time())}")
+    def _start_torch_profiler_session(self) -> None:
+        """PyTorch 프로파일러 세션 시작"""
+        profile_path = os.path.join(self.config.profile_dir, f"torch_profile_{int(time.time())}")
 
-            self.torch_profiler_session = torch_profiler.profile(
-                activities=[
-                    torch_profiler.ProfilerActivity.CPU,
-                    torch_profiler.ProfilerActivity.CUDA
-                ] if torch.cuda.is_available() else [torch_profiler.ProfilerActivity.CPU],
-                schedule=torch_profiler.schedule(
-                    wait=1,
-                    warmup=1,
-                    active=2
-                ),
-                on_trace_ready=torch_profiler.tensorboard_trace_handler(profile_path),
-                record_shapes=True,
-                with_stack=True,
-                profile_memory=True
-            )
+        self.torch_profiler_session = torch_profiler.profile(
+            activities=[
+                torch_profiler.ProfilerActivity.CPU,
+                torch_profiler.ProfilerActivity.CUDA
+            ] if torch.cuda.is_available() else [torch_profiler.ProfilerActivity.CPU],
+            schedule=torch_profiler.schedule(
+                wait=1,
+                warmup=1,
+                active=2
+            ),
+            on_trace_ready=torch_profiler.tensorboard_trace_handler(profile_path),
+            record_shapes=True,
+            with_stack=True,
+            profile_memory=True
+        )
 
-            self.torch_profiler_session.__enter__()
-            logger.debug(f"PyTorch profiling session started, results will be saved to {profile_path}")
-
-        except Exception as err:
-            logger.error(f"Failed to start PyTorch profiling: {str(err)}", exc_info=True)
-            self.torch_profiler_session = None
+        self.torch_profiler_session.__enter__()
+        logger.debug(f"PyTorch profiling session started, results will be saved to {profile_path}")
 
     def _save_profile_results(self) -> None:
         """프로파일 결과 저장"""
@@ -360,32 +394,44 @@ class SystemProfiler:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         # 메모리 스냅샷 저장
-        if self.memory_snapshots:
-            try:
-                memory_file = os.path.join(self.config.profile_dir, f"memory_profile_{timestamp}.json")
-                with open(memory_file, 'w', encoding='utf-8') as func_f:
-                    json.dump(
-                        [asdict(snapshot) for snapshot in self.memory_snapshots[-10:]],  # 최근 10개만 저장
-                        func_f,
-                        indent=2
-                    )
-                logger.debug(f"Memory snapshots saved to {memory_file}")
-            except Exception as errr:
-                logger.error(f"Failed to save memory snapshots: {str(errr)}", exc_info=True)
+        self._save_memory_snapshots(timestamp)
 
         # 함수 프로파일 저장
-        if self.function_profiles:
-            try:
-                functions_file = os.path.join(self.config.profile_dir, f"function_profile_{timestamp}.json")
-                with open(functions_file, 'w', encoding='utf-8') as func_f:
-                    json.dump(
-                        {k: asdict(v) for k, v in self.function_profiles.items()},
-                        func_f,
-                        indent=2
-                    )
-                logger.debug(f"Function profiles saved to {functions_file}")
-            except Exception as err:
-                logger.error(f"Failed to save function profiles: {str(err)}", exc_info=True)
+        self._save_function_profiles(timestamp)
+
+    def _save_memory_snapshots(self, timestamp: str) -> None:
+        """메모리 스냅샷 저장"""
+        if not self.memory_snapshots:
+            return
+
+        try:
+            memory_file = os.path.join(self.config.profile_dir, f"memory_profile_{timestamp}.json")
+            with open(memory_file, 'w', encoding='utf-8') as func_f:
+                json.dump(
+                    [asdict(snapshot) for snapshot in self.memory_snapshots[-10:]],  # 최근 10개만 저장
+                    func_f,
+                    indent=2
+                )
+            logger.debug(f"Memory snapshots saved to {memory_file}")
+        except Exception as errr:
+            logger.error(f"Failed to save memory snapshots: {str(errr)}", exc_info=True)
+
+    def _save_function_profiles(self, timestamp: str) -> None:
+        """함수 프로파일 저장"""
+        if not self.function_profiles:
+            return
+
+        try:
+            functions_file = os.path.join(self.config.profile_dir, f"function_profile_{timestamp}.json")
+            with open(functions_file, 'w', encoding='utf-8') as func_f:
+                json.dump(
+                    {k: asdict(v) for k, v in self.function_profiles.items()},
+                    func_f,
+                    indent=2
+                )
+            logger.debug(f"Function profiles saved to {functions_file}")
+        except Exception as err:
+            logger.error(f"Failed to save function profiles: {str(err)}", exc_info=True)
 
     def profile_function(self, p_func: Callable) -> Callable:
         """
@@ -407,7 +453,6 @@ class SystemProfiler:
 
             # 함수 정보
             func_name = p_func.__name__
-            # module_name = p_func.__module__
             # p_func를 Callable 대신 Any로 캐스팅
             module_name = cast(Any, p_func).__module__
             key = f"{module_name}.{func_name}"
@@ -465,30 +510,7 @@ class SystemProfiler:
 
             # 변화량 계산 (이전 스냅샷이 있는 경우)
             if prev_snapshot:
-                ram_change = current_snapshot.process_ram_used_gb - prev_snapshot.process_ram_used_gb
-                report["changes"] = {
-                    "process_ram_gb": f"{ram_change:.3f} "
-                                      f"({'+' if ram_change >= 0 else ''}"
-                                      f"{ram_change / prev_snapshot.process_ram_used_gb * 100:.1f}%"
-                                      f")" if prev_snapshot.process_ram_used_gb > 0 else "N/A"
-                }
-
-                # GPU 메모리 변화 (장치가 동일한 경우)
-                if current_snapshot.gpu_memory and prev_snapshot.gpu_memory:
-                    gpu_changes = []
-                    for idx, (curr, prev) in enumerate(zip(current_snapshot.gpu_memory, prev_snapshot.gpu_memory)):
-                        if curr["id"] == prev["id"]:
-                            mem_change = curr["memory_allocated_gb"] - prev["memory_allocated_gb"]
-                            gpu_changes.append({
-                                "id": curr["id"],
-                                "memory_change_gb": f"{mem_change:.3f}",
-                                "change_percent": f"{'+' if mem_change >= 0 else ''}"
-                                                  f"{mem_change / prev['memory_allocated_gb'] * 100:.1f}%" if
-                                prev['memory_allocated_gb'] > 0 else "N/A"
-                            })
-
-                    if gpu_changes:
-                        report["changes"]["gpu_memory"] = gpu_changes
+                report["changes"] = self._calculate_memory_changes(current_snapshot, prev_snapshot)
 
             return report
 
@@ -499,6 +521,37 @@ class SystemProfiler:
                 "error": str(err),
                 "timestamp": datetime.now().isoformat()
             }
+
+    @classmethod
+    def _calculate_memory_changes(cls, current: MemorySnapshot, previous: MemorySnapshot) -> Dict[str, Any]:
+        """두 스냅샷 간의 메모리 변화량 계산"""
+        changes = {}
+
+        # RAM 변화량
+        ram_change = current.process_ram_used_gb - previous.process_ram_used_gb
+        changes["process_ram_gb"] = f"{ram_change:.3f} " + \
+                                    f"({'+' if ram_change >= 0 else ''}" + \
+                                    f"{ram_change / previous.process_ram_used_gb * 100:.1f}%" + \
+                                    f")" if previous.process_ram_used_gb > 0 else "N/A"
+
+        # GPU 메모리 변화 (장치가 동일한 경우)
+        if current.gpu_memory and previous.gpu_memory:
+            gpu_changes = []
+            for idx, (curr_gpu, prev_gpu) in enumerate(zip(current.gpu_memory, previous.gpu_memory)):
+                if curr_gpu.id == prev_gpu.id:
+                    mem_change = curr_gpu.memory_allocated_gb - prev_gpu.memory_allocated_gb
+                    gpu_changes.append({
+                        "id": curr_gpu.id,
+                        "memory_change_gb": f"{mem_change:.3f}",
+                        "change_percent": f"{'+' if mem_change >= 0 else ''}"
+                                          f"{mem_change / prev_gpu.memory_allocated_gb * 100:.1f}"
+                                          f"%" if prev_gpu.memory_allocated_gb > 0 else "N/A"
+                    })
+
+            if gpu_changes:
+                changes["gpu_memory"] = gpu_changes
+
+        return changes
 
     async def get_function_stats(self, top_n: int = 20) -> Dict[str, Any]:
         """
@@ -556,47 +609,30 @@ class SystemProfiler:
             시스템 상태 보고서
         """
         try:
+            # CPU 정보 수집
+            cpu_stats = cls._collect_cpu_stats()
+
+            # 메모리 정보 수집
+            memory_stats = cls._collect_memory_stats()
+
+            # 디스크 정보 수집
+            disk_stats = cls._collect_disk_stats()
+
+            # 프로세스 정보 수집
+            process_stats = cls._collect_process_stats()
+
+            # 기본 통계 정보
             stats = {
                 "timestamp": datetime.now().isoformat(),
-                "cpu": {
-                    "usage_percent": psutil.cpu_percent(interval=0.1),
-                    "count_logical": psutil.cpu_count(),
-                    "count_physical": psutil.cpu_count(logical=False),
-                    "load_avg": psutil.getloadavg()
-                },
-                "memory": {
-                    "total_gb": psutil.virtual_memory().total / (1024 ** 3),
-                    "available_gb": psutil.virtual_memory().available / (1024 ** 3),
-                    "used_gb": psutil.virtual_memory().used / (1024 ** 3),
-                    "percent": psutil.virtual_memory().percent
-                },
-                "disk": {
-                    "total_gb": psutil.disk_usage('/').total / (1024 ** 3),
-                    "used_gb": psutil.disk_usage('/').used / (1024 ** 3),
-                    "free_gb": psutil.disk_usage('/').free / (1024 ** 3),
-                    "percent": psutil.disk_usage('/').percent
-                },
-                "process": {
-                    "pid": os.getpid(),
-                    "memory_gb": psutil.Process(os.getpid()).memory_info().rss / (1024 ** 3),
-                    "cpu_percent": psutil.Process(os.getpid()).cpu_percent(interval=0.1),
-                    "threads": len(psutil.Process(os.getpid()).threads())
-                }
+                "cpu": cpu_stats,
+                "memory": memory_stats,
+                "disk": disk_stats,
+                "process": process_stats
             }
 
-            # GPU 정보 추가
+            # GPU 정보 추가 (가능한 경우)
             if torch.cuda.is_available():
-                gpu_stats = []
-                for idx in range(torch.cuda.device_count()):
-                    gpu_info = {
-                        "id": idx,
-                        "name": torch.cuda.get_device_name(idx),
-                        "memory_allocated_gb": torch.cuda.memory_allocated(idx) / (1024 ** 3),
-                        "memory_reserved_gb": torch.cuda.memory_reserved(idx) / (1024 ** 3)
-                    }
-                    gpu_stats.append(gpu_info)
-
-                stats["gpu"] = gpu_stats
+                stats["gpu"] = cls._collect_gpu_stats()
 
             return stats
 
@@ -607,6 +643,64 @@ class SystemProfiler:
                 "error": str(err),
                 "timestamp": datetime.now().isoformat()
             }
+
+    @staticmethod
+    def _collect_cpu_stats() -> Dict[str, Any]:
+        """CPU 통계 수집"""
+        return {
+            "usage_percent": psutil.cpu_percent(interval=0.1),
+            "count_logical": psutil.cpu_count(),
+            "count_physical": psutil.cpu_count(logical=False),
+            "load_avg": psutil.getloadavg()
+        }
+
+    @staticmethod
+    def _collect_memory_stats() -> Dict[str, Any]:
+        """메모리 통계 수집"""
+        mem = psutil.virtual_memory()
+        return {
+            "total_gb": mem.total / (1024 ** 3),
+            "available_gb": mem.available / (1024 ** 3),
+            "used_gb": mem.used / (1024 ** 3),
+            "percent": mem.percent
+        }
+
+    @staticmethod
+    def _collect_disk_stats() -> Dict[str, Any]:
+        """디스크 통계 수집"""
+        disk = psutil.disk_usage('/')
+        return {
+            "total_gb": disk.total / (1024 ** 3),
+            "used_gb": disk.used / (1024 ** 3),
+            "free_gb": disk.free / (1024 ** 3),
+            "percent": disk.percent
+        }
+
+    @staticmethod
+    def _collect_process_stats() -> Dict[str, Any]:
+        """현재 프로세스 통계 수집"""
+        pid = os.getpid()
+        process = psutil.Process(pid)
+        return {
+            "pid": pid,
+            "memory_gb": process.memory_info().rss / (1024 ** 3),
+            "cpu_percent": process.cpu_percent(interval=0.1),
+            "threads": len(process.threads())
+        }
+
+    @staticmethod
+    def _collect_gpu_stats() -> List[Dict[str, Any]]:
+        """GPU 통계 수집"""
+        gpu_stats = []
+        for idx in range(torch.cuda.device_count()):
+            gpu_info = {
+                "id": idx,
+                "name": torch.cuda.get_device_name(idx),
+                "memory_allocated_gb": torch.cuda.memory_allocated(idx) / (1024 ** 3),
+                "memory_reserved_gb": torch.cuda.memory_reserved(idx) / (1024 ** 3)
+            }
+            gpu_stats.append(gpu_info)
+        return gpu_stats
 
 
 # 활성 프로파일러 인스턴스 (싱글톤)
@@ -718,8 +812,7 @@ async def get_profiler_system_stats() -> Dict[str, Any]:
     Returns:
         시스템 상태 보고서
     """
-    profiler_ = get_profiler()
-    return await profiler_.get_system_stats()
+    return await SystemProfiler.get_system_stats()
 
 
 # 프로파일러 초기화
@@ -745,6 +838,172 @@ def init_profiling():
         return None
 
 
+# 테스트 유틸리티 함수들
+class ProfilerTestUtils:
+    """프로파일러 테스트를 위한 유틸리티 클래스"""
+
+    @staticmethod
+    def run_cpu_test(iterations: int = 1000000) -> int:
+        """CPU 부하 테스트 함수"""
+        logger.info(f"CPU 부하 테스트 시작 (n={iterations})")
+        result = 0
+        for idx in range(iterations):
+            result += idx ** 2
+        return result
+
+    @staticmethod
+    def run_memory_test(size_mb: int = 100) -> int:
+        """메모리 사용량 테스트 함수"""
+        logger.info(f"메모리 테스트 시작 (size={size_mb}MB)")
+        # size_mb 크기의 메모리 할당
+        data = [0] * (size_mb * 131072)  # 약 1MB = 1024 * 1024 / 8 (bytes per int)
+        return sum(data[:100])  # 계산을 통해 최적화 방지
+
+    @staticmethod
+    def run_gpu_test(tensor_size: int = 1000) -> float:
+        """GPU 테스트 함수"""
+        if not torch.cuda.is_available():
+            logger.warning("CUDA를 사용할 수 없어 GPU 테스트를 건너뜁니다")
+            return 0.0
+
+        logger.info(f"GPU 테스트 시작 (크기: {tensor_size}x{tensor_size})")
+        x = torch.rand(tensor_size, tensor_size, device="cuda")
+        y = torch.rand(tensor_size, tensor_size, device="cuda")
+
+        # 행렬 곱셈 수행
+        with profile_block("gpu_matrix_multiply"):
+            z = torch.matmul(x, y)
+
+        return z.sum().item()
+
+    @staticmethod
+    def visualize_results(t_profiler: SystemProfiler, t_output_dir: str) -> None:
+        """프로파일링 결과 시각화"""
+        try:
+            import matplotlib.pyplot as plt
+            import numpy as np
+
+            logger.info("결과 시각화 시작")
+            os.makedirs(t_output_dir, exist_ok=True)
+
+            # 메모리 스냅샷 시각화
+            ProfilerTestUtils._visualize_memory_usage(t_profiler, t_output_dir)
+
+            # GPU 메모리 시각화
+            ProfilerTestUtils._visualize_gpu_memory(t_profiler, t_output_dir)
+
+            # 함수 실행 시간 시각화
+            ProfilerTestUtils._visualize_function_times(t_profiler, t_output_dir)
+
+        except ImportError:
+            logger.warning("matplotlib이 설치되지 않아 시각화를 건너뜁니다")
+        except Exception as err:
+            logger.error(f"시각화 중 오류 발생: {err}", exc_info=True)
+
+    @staticmethod
+    def _visualize_memory_usage(t_profiler: SystemProfiler, t_output_dir: str) -> None:
+        """메모리 사용량 시각화"""
+        import matplotlib.pyplot as plt
+
+        if len(t_profiler.memory_snapshots) <= 1:
+            return
+
+        # 시간에 따른 프로세스 메모리 사용량
+        plt.figure(figsize=(10, 6))
+        timestamps = list(range(len(t_profiler.memory_snapshots)))
+        memory_values = [snap.process_ram_used_gb for snap in t_profiler.memory_snapshots]
+
+        plt.plot(timestamps, memory_values, 'b-', marker='o')
+        plt.title('프로세스 메모리 사용량 변화')
+        plt.xlabel('스냅샷 순서')
+        plt.ylabel('메모리 사용량 (GB)')
+        plt.grid(True)
+        plt.savefig(f"{t_output_dir}/memory_usage.png")
+        logger.info(f"메모리 사용량 그래프 저장됨: {t_output_dir}/memory_usage.png")
+
+    @staticmethod
+    def _visualize_gpu_memory(t_profiler: SystemProfiler, t_output_dir: str) -> None:
+        """GPU 메모리 사용량 시각화"""
+        import matplotlib.pyplot as plt
+
+        if not torch.cuda.is_available() or len(t_profiler.memory_snapshots) <= 1:
+            return
+
+        if not t_profiler.memory_snapshots[0].gpu_memory:
+            return
+
+        plt.figure(figsize=(10, 6))
+        timestamps = list(range(len(t_profiler.memory_snapshots)))
+        gpu_memory_values = []
+
+        # 각 GPU별 메모리 사용량 추출
+        for gpu_idx in range(torch.cuda.device_count()):
+            values = []
+            for snap in t_profiler.memory_snapshots:
+                if gpu_idx < len(snap.gpu_memory):
+                    values.append(snap.gpu_memory[gpu_idx].memory_allocated_gb)
+                else:
+                    values.append(0)
+            gpu_memory_values.append(values)
+
+        # 각 GPU별 그래프 그리기
+        colors = ['b', 'r', 'g', 'c', 'm', 'y']
+        for idx, values in enumerate(gpu_memory_values):
+            plt.plot(timestamps, values,
+                     color=colors[idx % len(colors)],
+                     marker='o',
+                     label=f'GPU {idx}')
+
+        plt.title('GPU 메모리 사용량 변화')
+        plt.xlabel('스냅샷 순서')
+        plt.ylabel('할당된 메모리 (GB)')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(f"{t_output_dir}/gpu_memory_usage.png")
+        logger.info(f"GPU 메모리 그래프 저장됨: {t_output_dir}/gpu_memory_usage.png")
+
+    @staticmethod
+    def _visualize_function_times(t_profiler: SystemProfiler, t_output_dir: str) -> None:
+        """함수 실행 시간 시각화"""
+        import matplotlib.pyplot as plt
+
+        if not t_profiler.function_profiles:
+            return
+
+        plt.figure(figsize=(12, 8))
+
+        # 상위 10개 함수만 선택
+        top_functions = sorted(
+            t_profiler.function_profiles.values(),
+            key=lambda x: x.total_time,
+            reverse=True
+        )[:10]
+
+        function_names = [f"{t_func.module_name}.{t_func.function_name}" for t_func in top_functions]
+        avg_times = [t_func.avg_time for t_func in top_functions]
+        total_times = [t_func.total_time for t_func in top_functions]
+
+        # 평균 실행 시간 그래프
+        plt.subplot(2, 1, 1)
+        plt.barh(range(len(function_names)), avg_times, color='skyblue')
+        plt.yticks(range(len(function_names)), function_names)
+        plt.title('함수별 평균 실행 시간')
+        plt.xlabel('시간 (초)')
+        plt.grid(axis='x')
+
+        # 총 실행 시간 그래프
+        plt.subplot(2, 1, 2)
+        plt.barh(range(len(function_names)), total_times, color='salmon')
+        plt.yticks(range(len(function_names)), function_names)
+        plt.title('함수별 총 실행 시간')
+        plt.xlabel('시간 (초)')
+        plt.grid(axis='x')
+
+        plt.tight_layout()
+        plt.savefig(f"{t_output_dir}/function_times.png")
+        logger.info(f"함수 실행 시간 그래프 저장됨: {t_output_dir}/function_times.png")
+
+
 # 모듈 테스트 코드
 if __name__ == "__main__":
     # 로깅 레벨 설정
@@ -753,9 +1012,6 @@ if __name__ == "__main__":
     logger.info("프로파일러 테스트 시작")
 
     # 결과 저장 디렉토리 생성
-    import os
-    from datetime import datetime
-
     output_dir = f"./profile_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     os.makedirs(output_dir, exist_ok=True)
     logger.info(f"결과 저장 디렉토리: {output_dir}")
@@ -776,28 +1032,18 @@ if __name__ == "__main__":
     logger.info("프로파일러 시작됨")
 
     try:
-        # ===== 1. CPU 부하 테스트 함수 =====
+        # CPU 부하 테스트
         @profile
         def cpu_intensive_test(num):
-            """CPU 집약적인 작업 테스트"""
-            logger.info(f"CPU 부하 테스트 시작 (n={num})")
-            result = 0
-            for idx in range(num):
-                result += idx ** 2
-            return result
+            return ProfilerTestUtils.run_cpu_test(num)
 
-
-        # ===== 2. 메모리 사용 테스트 함수 =====
+        # 메모리 사용 테스트
         @profile
         def memory_test(size_mb):
-            """메모리 사용량 테스트"""
-            logger.info(f"메모리 테스트 시작 (size={size_mb}MB)")
-            # size_mb 크기의 메모리 할당
-            data = [0] * (size_mb * 131072)  # 약 1MB = 1024 * 1024 / 8 (bytes per int)
-            return sum(data[:100])  # 계산을 통해 최적화 방지
+            return ProfilerTestUtils.run_memory_test(size_mb)
 
 
-        # ===== 3. 의도적인 메모리 누수 시뮬레이션 =====
+        # 의도적인 메모리 누수 시뮬레이션
         memory_leak_storage = []
 
 
@@ -812,8 +1058,8 @@ if __name__ == "__main__":
                 logger.info(f"  누수 라운드 {idx + 1}/{rounds}: 현재 {len(memory_leak_storage)}개 객체")
                 time.sleep(1)  # 메모리 사용량 변화 관찰을 위한 지연
 
-
-        # ===== 4. GPU 테스트 함수 =====
+        # GPU 테스트
+        @profile
         def gpu_test():
             """GPU 사용 테스트 (CUDA 가능한 경우)"""
             if not torch.cuda.is_available():
@@ -822,157 +1068,22 @@ if __name__ == "__main__":
 
             logger.info(f"GPU 테스트 시작 (장치: {torch.cuda.get_device_name(0)})")
 
-            @profile
-            def gpu_matrix_multiply(size_gpu):
-                """GPU 행렬 곱셈 테스트"""
-                logger.info(f"GPU 행렬 곱셈 테스트 (크기: {size_gpu}x{size_gpu})")
-                x = torch.rand(size_gpu, size_gpu, device="cuda")
-                y = torch.rand(size_gpu, size_gpu, device="cuda")
-
-                with profile_block("gpu_matrix_multiply"):
-                    z = torch.matmul(x, y)
-
-                return z.sum().item()
-
-            @profile
-            def gpu_memory_test(size_gpu_mb):
-                """GPU 메모리 할당 테스트"""
-                logger.info(f"GPU 메모리 할당 테스트 (크기: {size_gpu_mb}MB)")
-                # float32 텐서 할당 (4bytes per float)
-                num_elements = int(size_gpu_mb * 1024 * 1024 / 4)
-                size_ = int(num_elements ** 0.5)
-
-                with profile_block("gpu_memory_allocation"):
-                    x = torch.rand(size_, size_, device="cuda")
-
-                with profile_block("gpu_operations"):
-                    y = torch.sin(x) + torch.cos(x)
-
-                return y.sum().item()
-
             # 다양한 크기로 GPU 테스트 실행
             for size_t in [1000, 2000, 3000]:
-                gpu_matrix_multiply(size_t)
+                ProfilerTestUtils.run_gpu_test(size_t)
                 time.sleep(1)  # GPU 메모리 해제를 위한 지연
 
-            # GPU 메모리 테스트
-            for size_mb in [100, 200, 400]:
-                gpu_memory_test(size_mb)
-                time.sleep(1)
-
-
+        # 동기 방식으로 시스템 상태를 가져오는 래퍼 함수
         def get_sync_system_stats():
-            """동기 방식으로 시스템 상태를 가져오는 래퍼 함수"""
-            return asyncio.run(profiler.get_system_stats())
-
+            return asyncio.run(SystemProfiler.get_system_stats())
 
         def get_sync_memory_report():
-            """동기 방식으로 시스템 상태를 가져오는 래퍼 함수"""
             return asyncio.run(profiler.get_memory_report())
 
-
         def get_sync_function_stats():
-            """동기 방식으로 시스템 상태를 가져오는 래퍼 함수"""
             return asyncio.run(profiler.get_function_stats(top_n=5))
 
-
-        # ===== 5. 결과 시각화 함수 =====
-        def visualize_results():
-            """프로파일링 결과 시각화"""
-            try:
-                import matplotlib.pyplot as plt
-                import numpy as np
-
-                logger.info("결과 시각화 시작")
-
-                # 메모리 스냅샷 시각화
-                if len(profiler.memory_snapshots) > 1:
-                    # 시간에 따른 프로세스 메모리 사용량
-                    plt.figure(figsize=(10, 6))
-                    timestamps = list(range(len(profiler.memory_snapshots)))
-                    memory_values = [snap.process_ram_used_gb for snap in profiler.memory_snapshots]
-
-                    plt.plot(timestamps, memory_values, 'b-', marker='o')
-                    plt.title('프로세스 메모리 사용량 변화')
-                    plt.xlabel('스냅샷 순서')
-                    plt.ylabel('메모리 사용량 (GB)')
-                    plt.grid(True)
-                    plt.savefig(f"{output_dir}/memory_usage.png")
-                    logger.info(f"메모리 사용량 그래프 저장됨: {output_dir}/memory_usage.png")
-
-                    # GPU 메모리 시각화 (CUDA 가능한 경우)
-                    if torch.cuda.is_available() and profiler.memory_snapshots[0].gpu_memory:
-                        plt.figure(figsize=(10, 6))
-                        gpu_memory_values = []
-
-                        # 각 GPU별 메모리 사용량 추출
-                        for gpu_idx in range(torch.cuda.device_count()):
-                            values = []
-                            for snap in profiler.memory_snapshots:
-                                if gpu_idx < len(snap.gpu_memory):
-                                    values.append(snap.gpu_memory[gpu_idx].get('memory_allocated_gb', 0))
-                                else:
-                                    values.append(0)
-                            gpu_memory_values.append(values)
-
-                        # 각 GPU별 그래프 그리기
-                        colors = ['b', 'r', 'g', 'c', 'm', 'y']
-                        for idx, values in enumerate(gpu_memory_values):
-                            plt.plot(timestamps, values,
-                                     color=colors[idx % len(colors)],
-                                     marker='o',
-                                     label=f'GPU {idx}')
-
-                        plt.title('GPU 메모리 사용량 변화')
-                        plt.xlabel('스냅샷 순서')
-                        plt.ylabel('할당된 메모리 (GB)')
-                        plt.legend()
-                        plt.grid(True)
-                        plt.savefig(f"{output_dir}/gpu_memory_usage.png")
-                        logger.info(f"GPU 메모리 그래프 저장됨: {output_dir}/gpu_memory_usage.png")
-
-                # 함수 실행 시간 시각화
-                if profiler.function_profiles:
-                    plt.figure(figsize=(12, 8))
-
-                    # 상위 10개 함수만 선택
-                    top_functions = sorted(
-                        profiler.function_profiles.values(),
-                        key=lambda x: x.total_time,
-                        reverse=True
-                    )[:10]
-
-                    function_names = [f"{t_func.module_name}.{t_func.function_name}" for t_func in top_functions]
-                    avg_times = [t_func.avg_time for t_func in top_functions]
-                    total_times = [t_func.total_time for t_func in top_functions]
-
-                    # 평균 실행 시간 그래프
-                    plt.subplot(2, 1, 1)
-                    plt.barh(range(len(function_names)), avg_times, color='skyblue')
-                    plt.yticks(range(len(function_names)), function_names)
-                    plt.title('함수별 평균 실행 시간')
-                    plt.xlabel('시간 (초)')
-                    plt.grid(axis='x')
-
-                    # 총 실행 시간 그래프
-                    plt.subplot(2, 1, 2)
-                    plt.barh(range(len(function_names)), total_times, color='salmon')
-                    plt.yticks(range(len(function_names)), function_names)
-                    plt.title('함수별 총 실행 시간')
-                    plt.xlabel('시간 (초)')
-                    plt.grid(axis='x')
-
-                    plt.tight_layout()
-                    plt.savefig(f"{output_dir}/function_times.png")
-                    logger.info(f"함수 실행 시간 그래프 저장됨: {output_dir}/function_times.png")
-
-            except ImportError:
-                logger.warning("matplotlib이 설치되지 않아 시각화를 건너뜁니다")
-            except Exception as err:
-                logger.error(f"시각화 중 오류 발생: {err}", exc_info=True)
-
-
-        # ===== 6. 테스트 실행 =====
+        # 테스트 실행
         logger.info("===== 테스트 시작 =====")
 
         # CPU 부하 테스트
@@ -1004,7 +1115,7 @@ if __name__ == "__main__":
                         f"RAM {system_stats['memory']['percent']:.1f}%")
             time.sleep(2)
 
-        # ===== 7. 결과 수집 및 보고서 생성 =====
+        # 결과 수집 및 보고서 생성
         logger.info("===== 결과 수집 중 =====")
 
         # 메모리 보고서
@@ -1024,7 +1135,7 @@ if __name__ == "__main__":
         result_data = {
             "memory_report": memory_report,
             "function_stats": function_stats,
-            "system_stats": profiler.get_system_stats()
+            "system_stats": get_sync_system_stats()
         }
 
         with open(f"{output_dir}/profile_results.json", "w") as f:
@@ -1033,7 +1144,7 @@ if __name__ == "__main__":
         logger.info(f"결과 JSON 저장됨: {output_dir}/profile_results.json")
 
         # 결과 시각화
-        visualize_results()
+        ProfilerTestUtils.visualize_results(profiler, output_dir)
 
         logger.info(f"===== 테스트 완료 =====")
         logger.info(f"모든 결과는 {output_dir} 디렉토리에 저장되었습니다")
