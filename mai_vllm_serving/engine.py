@@ -3,10 +3,8 @@ mai-vllm-serving의 엔진 구현
 vLLM 엔진의 성능과 안정성을 최적화하기 위한 래퍼 클래스
 """
 
-import logging
 import time
 import uuid
-import contextlib
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union, Any, AsyncIterator, AsyncGenerator
 
@@ -22,20 +20,16 @@ from mai_vllm_serving.monitoring.profiler import profile, profile_block, get_pro
 from mai_vllm_serving.utils.config import get_config
 # 로깅 유틸리티 임포트
 from mai_vllm_serving.utils.logging_utils import (
-    setup_logging,
-    TimingContext
+    get_logger,
+    TimingContext,
+    with_request_context
 )
 
 # 설정 객체 가져오기
 config = get_config()
 
-# 로깅 초기화
-logger = setup_logging(
-    service_name="mai-vllm-serving-engine",
-    log_level=config.logging.level,
-    use_json=config.logging.json,
-    log_file=config.logging.file
-)
+# 구조화된 로거 초기화로 변경
+logger = get_logger("engine")
 
 
 @dataclass
@@ -139,7 +133,13 @@ class MAIVLLMEngine:
             disable_log_stats: 통계 로깅 비활성화 여부
             enforce_eager: PyTorch eager 모드 강제 실행 여부
         """
-        logger.info("Initializing MAIVLLMEngine")
+        # 구조화된 로깅 사용으로 더 많은 컨텍스트 포함
+        logger.info("Initializing MAIVLLMEngine", context={
+            "initialization": {
+                "component": "engine",
+                "version": "0.1.0"
+            }
+        })
 
         # 설정에서 기본값 가져오기
         self.model_name = model_name or config.model.name
@@ -152,16 +152,32 @@ class MAIVLLMEngine:
         # GPU 사용 가능 여부 확인
         if torch.cuda.is_available():
             self.num_gpus = torch.cuda.device_count()
-            logger.info(f"Found {self.num_gpus} GPUs")
+            logger.info(f"Found {self.num_gpus} GPUs", context={
+                "hardware": {
+                    "gpu_count": self.num_gpus,
+                    "is_cuda_available": True
+                }
+            })
 
-            # GPU 정보 로깅
+            # GPU 정보 로깅 - 세부 정보는 DEBUG 레벨로 변경
+            gpu_info = []
             for i in range(self.num_gpus):
                 gpu_name = torch.cuda.get_device_name(i)
                 gpu_mem = torch.cuda.get_device_properties(i).total_memory / 1e9
-                logger.info(f"GPU {i}: {gpu_name}, Memory: {gpu_mem:.2f} GB")
+                gpu_info.append({
+                    "id": i,
+                    "name": gpu_name,
+                    "memory_gb": f"{gpu_mem:.2f}"
+                })
+
+            # 모든 GPU 정보를 한 번에 로깅
+            logger.debug("GPU details", context={"hardware": {"gpus": gpu_info}})
         else:
             self.num_gpus = 0
-            logger.warning("No GPUs available, using CPU. Performance will be significantly degraded.")
+            logger.warning(
+                "No GPUs available, using CPU. Performance will be significantly degraded.",
+                context={"hardware": {"is_cuda_available": False}}
+            )
 
         # 인자가 None인 경우 설정에서 가져오기
         if tensor_parallel_size is None:
@@ -188,7 +204,9 @@ class MAIVLLMEngine:
         # 양자화 설정
         if quantization is None and config.quantization.enabled:
             quantization = config.quantization.method
-            logger.info(f"Using quantization method: {quantization}")
+            logger.info(f"Using quantization method: {quantization}", context={
+                "engine": {"quantization": {"method": quantization}}
+            })
 
         # tensor_parallel_size 조정
         if tensor_parallel_size is None:
@@ -199,20 +217,31 @@ class MAIVLLMEngine:
         # tensor_parallel_size가 사용 가능한 GPU 수를 초과하는 경우 경고
         if 0 < self.num_gpus < tensor_parallel_size:
             logger.warning(
-                f"Requested tensor_parallel_size ({tensor_parallel_size}) > available GPUs ({self.num_gpus})")
+                f"Requested tensor_parallel_size ({tensor_parallel_size}) > available GPUs ({self.num_gpus})",
+                context={
+                    "engine": {
+                        "requested_tensor_parallel": tensor_parallel_size,
+                        "available_gpus": self.num_gpus,
+                        "action": "adjusting_down"
+                    }
+                }
+            )
             logger.warning(f"Setting tensor_parallel_size to {self.num_gpus}")
             tensor_parallel_size = self.num_gpus
 
-        # 엔진 설정 로깅
-        logger.info(f"Initializing vLLM engine with model: {self.model_name}")
-        logger.info(f"Engine configuration:")
-        logger.info(f"  - Tensor parallel size: {tensor_parallel_size}")
-        logger.info(f"  - GPU memory utilization: {gpu_memory_utilization}")
-        logger.info(f"  - Max num sequences: {max_num_seqs}")
-        logger.info(f"  - Max num batched tokens: {max_num_batched_tokens}")
-        logger.info(f"  - Block size: {config.engine.block_size}")
-        logger.info(f"  - Swap space: {swap_space} GB")
-        logger.info(f"  - Data type: {dtype}")
+        # 엔진 설정을 구조화된 방식으로 로깅
+        engine_config = {
+            "model": self.model_name,
+            "tensor_parallel_size": tensor_parallel_size,
+            "gpu_memory_utilization": gpu_memory_utilization,
+            "max_num_seqs": max_num_seqs,
+            "max_num_batched_tokens": max_num_batched_tokens,
+            "block_size": config.engine.block_size,
+            "swap_space": swap_space,
+            "dtype": dtype
+        }
+
+        logger.info("Engine configuration", context={"engine": engine_config})
 
         # 엔진 인자 설정
         engine_args = AsyncEngineArgs(
@@ -236,12 +265,31 @@ class MAIVLLMEngine:
             try:
                 with profile_block("engine_initialization"):  # 프로파일링 블록 추가
                     self.engine = AsyncLLMEngine.from_engine_args(engine_args)
-                logger.info(f"Engine initialization completed successfully in {timing.duration:.2f} seconds")
+                logger.info(
+                    f"Engine initialization completed successfully",
+                    context={
+                        "initialization": {
+                            "duration_seconds": timing.duration,
+                            "status": "success"
+                        }
+                    }
+                )
             except Exception as e:
-                logger.error(f"Failed to initialize engine: {str(e)}", exc_info=True)
+                logger.error(
+                    "Failed to initialize engine",
+                    context={
+                        "initialization": {
+                            "status": "failed",
+                            "error_type": type(e).__name__,
+                            "error_message": str(e)
+                        }
+                    },
+                    exc_info=True
+                )
                 raise
 
     @profile
+    @with_request_context
     async def generate(self, req_config: RequestConfig) -> Union[Dict[str, Any], AsyncIterator[Dict[str, Any]]]:
         """
         텍스트 생성 요청 처리
@@ -263,12 +311,27 @@ class MAIVLLMEngine:
             # 요청 처리 시작 기록
             metrics_collector.start_request(req_config.request_id)
 
-        # 추론 시작 로깅
-        logger.debug(f"Request {req_config.request_id} received: prompt length={len(req_config.prompt)}, "
-                     f"max_tokens={req_config.max_tokens}, temperature={req_config.temperature}")
+        # 추론 시작 로깅 - 구조화된 로깅 사용
+        request_context = {
+            "request": {
+                "id": req_config.request_id,
+                "prompt_length": len(req_config.prompt),
+                "max_tokens": req_config.max_tokens,
+                "temperature": req_config.temperature,
+                "stream": req_config.stream
+            }
+        }
+
+        # 요청 ID를 구조화된 로거에 설정
+        logger.set_request_id(req_config.request_id)
+
+        logger.info(
+            f"Request received",
+            context=request_context
+        )
 
         # 타이밍 컨텍스트 시작
-        with TimingContext(logger, f"Request {req_config.request_id} processing") as timing:
+        with TimingContext(logger, f"Request processing") as timing:
             # 요청 통계 초기화
             self.inference_stats[req_config.request_id] = InferenceStats(
                 request_id=req_config.request_id,
@@ -304,7 +367,9 @@ class MAIVLLMEngine:
 
                 # 스트리밍 모드인 경우
                 if req_config.stream:
-                    logger.debug(f"Starting streaming response for request {req_config.request_id}")
+                    logger.debug(f"Starting streaming response", context={
+                        "request": {"mode": "streaming"}
+                    })
                     with profile_block(f"stream_request_{req_config.request_id}"):
                         return self._stream_generator(engine_request, sampling_params, timing, metrics_collector)
 
@@ -318,8 +383,10 @@ class MAIVLLMEngine:
                         result = res
 
                 if result is None:
-                    err_msg = f"No result generated for request {req_config.request_id}"
-                    logger.error(err_msg)
+                    err_msg = f"No result generated"
+                    logger.error(err_msg, context={
+                        "request": {"status": "failed", "error": "empty_result"}
+                    })
                     # 모니터링이 활성화된 경우에만 메트릭 업데이트
                     if config.monitoring.enabled and metrics_collector:
                         metrics_collector.fail_request(req_config.request_id, err_msg)
@@ -337,11 +404,17 @@ class MAIVLLMEngine:
                         prompt_tokens=len(result.prompt_token_ids)
                     )
 
-                # 로깅
+                # 로깅 - 구조화된 형식으로 변경
                 logger.info(
-                    f"Request {req_config.request_id} completed: {stats.prompt_tokens} prompt tokens, "
-                    f"{stats.completion_tokens} completion tokens in {stats.inference_time:.3f}s "
-                    f"({stats.tokens_per_second:.2f} tokens/sec)"
+                    f"Request completed",
+                    context={
+                        "performance": {
+                            "prompt_tokens": stats.prompt_tokens,
+                            "completion_tokens": stats.completion_tokens,
+                            "inference_time": stats.inference_time,
+                            "tokens_per_second": stats.tokens_per_second
+                        }
+                    }
                 )
 
                 return {
@@ -360,7 +433,16 @@ class MAIVLLMEngine:
                 }
 
             except Exception as e:
-                logger.error(f"Error processing request {req_config.request_id}: {str(e)}", exc_info=True)
+                logger.error(
+                    "Error processing request",
+                    context={
+                        "error": {
+                            "type": type(e).__name__,
+                            "message": str(e)
+                        }
+                    },
+                    exc_info=True
+                )
                 # 메트릭 수집기에 실패 기록 - 모니터링이 활성화된 경우에만
                 if config.monitoring.enabled and metrics_collector:
                     metrics_collector.fail_request(req_config.request_id, str(e))
@@ -369,6 +451,8 @@ class MAIVLLMEngine:
             finally:
                 # 활성 요청 수 감소
                 self.active_requests -= 1
+                # 요청 ID 해제
+                logger.set_request_id(None)
 
     async def _stream_generator(self, engine_request: RequestConfig,
                                 sampling_params: SamplingParams,
@@ -401,6 +485,17 @@ class MAIVLLMEngine:
         current_batch = ""  # 현재 배치에 모인 텍스트
         last_send_time = time.time()  # 마지막 전송 시간
 
+        # 요청 컨텍스트에 스트리밍 정보 추가
+        logger.with_context(streaming=True, batch_size=batch_size_chars)
+
+        # 상세 디버그 로깅
+        logger.debug("Stream generation started", context={
+            "streaming": {
+                "batch_size_chars": batch_size_chars,
+                "batch_max_wait_time": batch_max_wait_time
+            }
+        })
+
         try:
             async for result in self.engine.generate(
                     prompt=engine_request.prompt,
@@ -415,6 +510,16 @@ class MAIVLLMEngine:
                 current_text = output.text
                 new_text = current_text[previous_text_length:]
                 previous_text_length = len(current_text)
+
+                # 매우 상세한 로깅은 TRACE 레벨로 간주하고 DEBUG에서만 출력
+                if config.logging.level.upper() == "DEBUG":
+                    logger.debug(f"Stream chunk received", context={
+                        "streaming": {
+                            "new_text_length": len(new_text),
+                            "total_text_length": len(current_text),
+                            "tokens_generated": tokens_generated
+                        }
+                    })
 
                 # 새 텍스트를 현재 배치에 추가
                 current_batch += new_text
@@ -465,14 +570,30 @@ class MAIVLLMEngine:
                             prompt_tokens=prompt_tokens
                         )
 
-                    # 로깅
+                    # 로깅 - 구조화된 형식으로 변경
+                    tokens_per_sec = tokens_generated / timing.duration if timing.duration > 0 else 0
                     logger.info(
-                        f"Streaming request {request_id} completed: {tokens_generated} tokens in "
-                        f"{timing.duration:.3f}s ({tokens_generated / timing.duration if timing.duration > 0 else 0:.2f} tokens/sec)"
+                        f"Streaming request completed",
+                        context={
+                            "streaming": {
+                                "tokens_generated": tokens_generated,
+                                "duration_seconds": timing.duration,
+                                "tokens_per_second": tokens_per_sec
+                            }
+                        }
                     )
 
         except Exception as e:
-            logger.error(f"Error in stream generation for request {request_id}: {str(e)}", exc_info=True)
+            logger.error(
+                "Error in stream generation",
+                context={
+                    "error": {
+                        "type": type(e).__name__,
+                        "message": str(e)
+                    }
+                },
+                exc_info=True
+            )
 
             # MAIVLLMEngine에는 _request_lock이 없으므로 이 부분 제거
             # 대신 필요한 경우 오류 정보를 inference_stats에 직접 저장
@@ -493,6 +614,8 @@ class MAIVLLMEngine:
         finally:
             # 활성 요청 수 감소 (MAIVLLMEngine에서는 락 없이 직접 감소)
             self.active_requests -= 1
+            # 컨텍스트 정리
+            logger.clear_context()
 
     def _update_stats(self, request_id: str, result: RequestOutput, timing: TimingContext) -> InferenceStats:
         """
@@ -507,7 +630,9 @@ class MAIVLLMEngine:
             업데이트 된 추론 통계
         """
         if request_id not in self.inference_stats:
-            logger.warning(f"Request ID {request_id} not found in inference_stats")
+            logger.warning(f"Request ID not found in inference_stats", context={
+                "request": {"id": request_id, "status": "unknown"}
+            })
             return InferenceStats(
                 request_id=request_id,
                 prompt_tokens=0,
@@ -532,9 +657,15 @@ class MAIVLLMEngine:
 
         # 통계 로깅 (디버그 레벨로 상세 정보 로깅)
         logger.debug(
-            f"Request {request_id} stats: {stats.prompt_tokens} prompt tokens, "
-            f"{stats.completion_tokens} completion tokens, {stats.inference_time:.3f}s, "
-            f"{stats.tokens_per_second:.2f} tokens/sec"
+            "Request statistics",
+            context={
+                "stats": {
+                    "prompt_tokens": stats.prompt_tokens,
+                    "completion_tokens": stats.completion_tokens,
+                    "inference_time": stats.inference_time,
+                    "tokens_per_second": stats.tokens_per_second
+                }
+            }
         )
 
         return stats
@@ -546,112 +677,180 @@ class MAIVLLMEngine:
         Returns:
             성능 통계 정보
         """
-        # GPU 사용량 정보
-        gpu_info = []
-        if torch.cuda.is_available():
-            for i in range(torch.cuda.device_count()):
-                gpu_name = torch.cuda.get_device_name(i)
-                gpu_mem_allocated = torch.cuda.memory_allocated(i) / 1e9
-                gpu_mem_reserved = torch.cuda.memory_reserved(i) / 1e9
-                gpu_info.append({
-                    "id": i,
-                    "name": gpu_name,
-                    "memory_allocated_gb": f"{gpu_mem_allocated:.2f}",
-                    "memory_reserved_gb": f"{gpu_mem_reserved:.2f}"
-                })
-
-        # 평균 처리 속도 계산
-        uptime = time.time() - self.start_time
-        tokens_per_second = self.total_tokens_generated / uptime if uptime > 0 else 0
-
-        # 메트릭 수집기에서 추가 정보 가져오기 - 모니터링이 활성화된 경우에만
-        metrics_info = {}
-        if config.monitoring.enabled:
+        # 시작 시간 측정을 위한 타이밍 컨텍스트
+        with TimingContext(logger, "Stats collection") as timing:
             try:
-                metrics_collector = get_metrics_collector()
-                metrics_info = metrics_collector.get_metrics()
-            except Exception as e:
-                logger.warning(f"Failed to get metrics from collector: {str(e)}")
+                # GPU 사용량 정보
+                gpu_info = []
+                if torch.cuda.is_available():
+                    for i in range(torch.cuda.device_count()):
+                        gpu_name = torch.cuda.get_device_name(i)
+                        gpu_mem_allocated = torch.cuda.memory_allocated(i) / 1e9
+                        gpu_mem_reserved = torch.cuda.memory_reserved(i) / 1e9
+                        gpu_info.append({
+                            "id": i,
+                            "name": gpu_name,
+                            "memory_allocated_gb": f"{gpu_mem_allocated:.2f}",
+                            "memory_reserved_gb": f"{gpu_mem_reserved:.2f}"
+                        })
 
-        # 기본 통계 정보
-        stats = {
-            "model": self.model_name,
-            "uptime": f"{uptime:.2f}",
-            "active_requests": self.active_requests,
-            "total_requests": self.total_requests,
-            "total_tokens_generated": self.total_tokens_generated,
-            "tokens_per_second_avg": f"{tokens_per_second:.2f}",
-            "gpu_info": gpu_info
-        }
+                # 평균 처리 속도 계산
+                uptime = time.time() - self.start_time
+                tokens_per_second = self.total_tokens_generated / uptime if uptime > 0 else 0
 
-        # 메트릭 정보가 있으면 추가
-        if metrics_info:
-            stats["detailed_metrics"] = {
-                "total_requests": metrics_info.get("total_requests", 0),
-                "total_successes": metrics_info.get("total_successes", 0),
-                "total_failures": metrics_info.get("total_failures", 0),
-                "total_tokens_input": metrics_info.get("total_tokens_input", 0),
-                "total_tokens_output": metrics_info.get("total_tokens_output", 0),
-                "avg_tokens_per_second": metrics_info.get("avg_tokens_per_second", 0),
-                "avg_request_time": metrics_info.get("avg_request_time", 0)
-            }
+                # 메트릭 수집기에서 추가 정보 가져오기 - 모니터링이 활성화된 경우에만
+                metrics_info = {}
+                if config.monitoring.enabled:
+                    try:
+                        metrics_collector = get_metrics_collector()
+                        metrics_info = metrics_collector.get_metrics()
+                        logger.debug("Retrieved metrics from collector", context={
+                            "metrics_collection": {"duration": timing.duration}
+                        })
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to get metrics from collector",
+                            context={"error": {"type": type(e).__name__, "message": str(e)}}
+                        )
 
-        # 프로파일링 정보 추가 - 모니터링이 활성화된 경우에만
-        if config.monitoring.enabled:
-            try:
-                profiler = get_profiler()
-                memory_report = profiler.get_memory_report()
-                function_stats = profiler.get_function_stats(top_n=5)  # 상위 5개 함수만
-
-                memory_data = await memory_report
-                function_data = await function_stats
-
-                stats["profiling"] = {
-                    "memory": {
-                        "process_ram_gb": await memory_data["current"]["process_ram_used_gb"],
-                        "system_ram_percent": await memory_data["current"]["system_ram_percent"]
-                    },
-                    "top_functions": [
-                        {
-                            "name": f"{func['module_name']}.{func['function_name']}",
-                            "avg_time": func["avg_time"],
-                            "call_count": func["call_count"]
-                        } for func in function_data.get("top_functions", [])[:5]
-                    ]
+                # 기본 통계 정보
+                stats = {
+                    "model": self.model_name,
+                    "uptime": f"{uptime:.2f}",
+                    "active_requests": self.active_requests,
+                    "total_requests": self.total_requests,
+                    "total_tokens_generated": self.total_tokens_generated,
+                    "tokens_per_second_avg": f"{tokens_per_second:.2f}",
+                    "gpu_info": gpu_info
                 }
-            except Exception as e:
-                logger.warning(f"Failed to get profiling stats: {str(e)}")
 
-        return stats
+                # 메트릭 정보가 있으면 추가
+                if metrics_info:
+                    stats["detailed_metrics"] = {
+                        "total_requests": metrics_info.get("total_requests", 0),
+                        "total_successes": metrics_info.get("total_successes", 0),
+                        "total_failures": metrics_info.get("total_failures", 0),
+                        "total_tokens_input": metrics_info.get("total_tokens_input", 0),
+                        "total_tokens_output": metrics_info.get("total_tokens_output", 0),
+                        "avg_tokens_per_second": metrics_info.get("avg_tokens_per_second", 0),
+                        "avg_request_time": metrics_info.get("avg_request_time", 0)
+                    }
+
+                # 프로파일링 정보 추가 - 모니터링이 활성화된 경우에만
+                if config.monitoring.enabled:
+                    try:
+                        profiler = get_profiler()
+                        memory_report = profiler.get_memory_report()
+                        function_stats = profiler.get_function_stats(top_n=5)  # 상위 5개 함수만
+
+                        memory_data = await memory_report
+                        function_data = await function_stats
+
+                        # 여기서 await 결과의 타입을 확인하고 적절히 처리
+                        # 구조화된 로깅을 통해 디버그 정보 추가
+                        logger.debug("Retrieved profiling data", context={
+                            "profiling": {
+                                "memory_report_size": len(str(memory_data)),
+                                "function_stats_count": len(function_data.get("top_functions", []))
+                            }
+                        })
+
+                        stats["profiling"] = {
+                            "memory": {
+                                "process_ram_gb": memory_data.get("current", {}).get("process_ram_used_gb", 0),
+                                "system_ram_percent": memory_data.get("current", {}).get("system_ram_percent", 0)
+                            },
+                            "top_functions": [
+                                {
+                                    "name": f"{func.get('module_name', '')}.{func.get('function_name', '')}",
+                                    "avg_time": func.get("avg_time", 0),
+                                    "call_count": func.get("call_count", 0)
+                                } for func in function_data.get("top_functions", [])[:5]
+                            ]
+                        }
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to get profiling stats",
+                            context={
+                                "error": {
+                                    "type": type(e).__name__,
+                                    "message": str(e),
+                                    "location": "get_stats.profiling"
+                                }
+                            }
+                        )
+
+                return stats
+
+            except Exception as e:
+                # 전체 메서드에 걸친 예외 처리 개선
+                logger.error(
+                    "Error getting engine stats",
+                    context={
+                        "error": {
+                            "type": type(e).__name__,
+                            "message": str(e),
+                            "location": "get_stats"
+                        }
+                    },
+                    exc_info=True
+                )
+                # 최소한의 정보라도 반환
+                return {
+                    "model": self.model_name,
+                    "error": f"Error getting stats: {str(e)}",
+                    "uptime": time.time() - self.start_time,
+                    "active_requests": self.active_requests
+                }
 
 
 # 테스트용 코드
 async def main():
     """메인 함수 (테스트용)"""
-    # 로깅 설정 업데이트
-    logging_level = getattr(logging, config.logging.level.upper())
-    logging.basicConfig(level=logging_level, format=config.logging.format)
+    # 구조화된 로거 사용
+    logger.info("Starting test main function", context={"environment": "test"})
 
-    # 엔진 인스턴스 생성
-    engine = MAIVLLMEngine()
+    try:
+        # 엔진 인스턴스 생성
+        logger.info("Creating engine instance", context={"test": {"phase": "engine_creation"}})
+        engine = MAIVLLMEngine()
 
-    # 샘플 요청 생성
-    test_config = RequestConfig(
-        prompt="Hello, how are you?",
-        max_tokens=100
-    )
+        # 샘플 요청 생성
+        test_config = RequestConfig(
+            prompt="Hello, how are you?",
+            max_tokens=100
+        )
 
-    # 추론 실행
-    result = await engine.generate(test_config)
-    print(json.dumps(result, indent=2))
+        # 추론 실행
+        logger.info("Starting test inference", context={"test": {"phase": "inference"}})
+        result = await engine.generate(test_config)
+        print(json.dumps(result, indent=2))
 
-    # 성능 통계 출력
-    stats = await engine.get_stats()
-    print(json.dumps(stats, indent=2))
+        # 성능 통계 출력
+        logger.info("Getting engine stats", context={"test": {"phase": "stats"}})
+        stats = await engine.get_stats()
+        print(json.dumps(stats, indent=2))
+
+        logger.info("Test completed successfully", context={"test": {"status": "success"}})
+
+    except Exception as e:
+        logger.error(
+            "Test failed",
+            context={
+                "test": {"status": "failed"},
+                "error": {"type": type(e).__name__, "message": str(e)}
+            },
+            exc_info=True
+        )
+    finally:
+        # 정리 작업
+        logger.info("Test cleanup completed", context={"test": {"phase": "cleanup"}})
 
 
 if __name__ == "__main__":
     import asyncio
     import json
 
+    # 테스트 시작 시 로깅 레벨 설정 - 개발 환경에서는 DEBUG로 설정
+    logger.info("Test mode started", context={"mode": "development", "component": "engine"})
     asyncio.run(main())

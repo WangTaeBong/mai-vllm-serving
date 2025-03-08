@@ -22,20 +22,16 @@ from mai_vllm_serving.monitoring.metrics import get_metrics_collector
 from mai_vllm_serving.monitoring.profiler import profile, profile_block
 from mai_vllm_serving.utils.config import get_config
 from mai_vllm_serving.utils.logging_utils import (
-    setup_logging,
-    TimingContext
+    get_logger,
+    TimingContext,
+    with_request_context
 )
 
 # 설정 객체 가져오기
 config = get_config()
 
-# 로깅 초기화
-logger = setup_logging(
-    service_name="mai-vllm-serving-distributed",
-    log_level=config.logging.level,
-    use_json=config.logging.json,
-    log_file=config.logging.file
-)
+# 구조화된 로거 초기화
+logger = get_logger("distributed")
 
 
 @dataclass
@@ -65,7 +61,15 @@ class DistributedConfig:
         master_port = os.environ.get("MASTER_PORT", config.distributed.master_port)
         backend = os.environ.get("DIST_BACKEND", config.distributed.backend)
         if not torch.cuda.is_available() and backend == "nccl":
-            logger.warning("CUDA not available. Changing backend from nccl to gloo")
+            logger.warning(
+                "CUDA not available. Changing backend from nccl to gloo",
+                context={
+                    "distributed": {
+                        "backend_change": {"from": "nccl", "to": "gloo"},
+                        "reason": "cuda_not_available"
+                    }
+                }
+            )
             backend = "gloo"
         init_method = os.environ.get("INIT_METHOD", None)
         timeout = int(os.environ.get("DIST_TIMEOUT", str(config.distributed.timeout)))
@@ -132,10 +136,31 @@ class DistributedVLLMEngine:
         self.local_rank = self.dist_config.local_rank
         self.is_master = self.rank == 0
 
+        # 분산 초기화 로깅 - 구조화된 컨텍스트 사용
+        dist_context = {
+            "distributed": {
+                "rank": self.rank,
+                "local_rank": self.local_rank,
+                "world_size": self.world_size,
+                "master_addr": self.dist_config.master_addr,
+                "master_port": self.dist_config.master_port,
+                "backend": self.dist_config.backend,
+                "is_master": self.is_master
+            }
+        }
+
+        # 마스터 노드에서만 INFO 레벨 로깅, 다른 노드는 DEBUG 레벨로 로깅
+        if self.is_master:
+            logger.info("Initializing distributed vLLM engine", context=dist_context)
+        else:
+            logger.debug("Initializing distributed vLLM engine worker", context=dist_context)
+
         # 모델 이름 설정
         self.model_name = model_name or config.model.name
         if not self.model_name:
-            raise ValueError("모델 이름이 지정되지 않았습니다. model_name 매개변수 또는 설정에서 지정해야 합니다.")
+            error_msg = "Model name not specified. Must be provided in parameters or configuration."
+            logger.error(error_msg, context={"initialization": {"status": "failed"}})
+            raise ValueError(error_msg)
 
         # 인자 검증 및 기본값 설정
         self._validate_and_set_defaults(
@@ -167,10 +192,32 @@ class DistributedVLLMEngine:
                 self._init_distributed()
 
             with profile_block("distributed_engine_init"):  # 프로파일링 블록 추가
-                self.engine = AsyncLLMEngine.from_engine_args(engine_args)
+                try:
+                    self.engine = AsyncLLMEngine.from_engine_args(engine_args)
 
-                if self.is_master:
-                    logger.info(f"Engine initialization completed in {timing.duration:.2f} seconds")
+                    if self.is_master:
+                        logger.info(
+                            "Engine initialization completed",
+                            context={
+                                "initialization": {
+                                    "status": "success",
+                                    "duration_seconds": timing.duration
+                                }
+                            }
+                        )
+                except Exception as e:
+                    logger.error(
+                        "Failed to initialize engine",
+                        context={
+                            "initialization": {
+                                "status": "failed",
+                                "error_type": type(e).__name__,
+                                "error_message": str(e)
+                            }
+                        },
+                        exc_info=True
+                    )
+                    raise
 
         # 요청 처리 관련 변수 초기화
         self.start_time = time.time()
@@ -185,39 +232,100 @@ class DistributedVLLMEngine:
     @classmethod
     def shutdown(cls):
         """분산 엔진 종료 및 리소스 정리"""
+        shutdown_context = {
+            "shutdown": {
+                "component": "distributed_engine",
+                "status": "starting"
+            }
+        }
+
+        logger.info("Shutting down distributed environment", context=shutdown_context)
+
         if dist.is_initialized():
-            logger.info("분산 환경 종료 중...")
             try:
                 # 타임아웃이 있는 barrier 사용
                 timeout = datetime.timedelta(seconds=30)
                 try:
+                    logger.debug("Waiting for all processes at barrier", context=shutdown_context)
                     dist.barrier(timeout=timeout)
-                    logger.info("모든 프로세스가 barrier에 도달했습니다.")
+                    logger.info(
+                        "All processes reached barrier",
+                        context={"shutdown": {"barrier": "success"}}
+                    )
                 except Exception as e:
-                    logger.warning(f"barrier 도달 중 오류 발생: {str(e)}. 계속 진행합니다.")
+                    logger.warning(
+                        "Error reaching barrier, continuing with shutdown",
+                        context={
+                            "shutdown": {
+                                "barrier": "failed",
+                                "error_type": type(e).__name__,
+                                "error_message": str(e)
+                            }
+                        }
+                    )
 
                 # CUDA 캐시 정리
                 if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    logger.info("CUDA 캐시를 정리했습니다.")
+                    with TimingContext(logger, "CUDA cache cleanup") as timing:
+                        torch.cuda.empty_cache()
+                    logger.info(
+                        "CUDA cache cleared",
+                        context={"shutdown": {"cuda_cleanup": "success", "duration": timing.duration}}
+                    )
 
                 # 프로세스 그룹 정리
+                logger.debug("Destroying process group", context=shutdown_context)
                 dist.destroy_process_group()
-                logger.info("분산 프로세스 그룹이 정상적으로 종료되었습니다.")
+                logger.info(
+                    "Distributed process group successfully destroyed",
+                    context={"shutdown": {"process_group": "success"}}
+                )
 
             except Exception as e:
-                logger.error(f"분산 환경 종료 중 오류 발생: {str(e)}", exc_info=True)
+                logger.error(
+                    "Error during distributed shutdown",
+                    context={
+                        "shutdown": {
+                            "status": "error",
+                            "error_type": type(e).__name__,
+                            "error_message": str(e)
+                        }
+                    },
+                    exc_info=True
+                )
                 # 중요: 오류가 발생해도 기본 정리는 시도
                 try:
                     dist.destroy_process_group()
-                except:
-                    pass
+                except Exception as inner_e:
+                    logger.warning(
+                        "Failed to destroy process group during recovery",
+                        context={
+                            "shutdown": {
+                                "recovery_attempt": "failed",
+                                "error_type": type(inner_e).__name__
+                            }
+                        }
+                    )
             finally:
-                # 환경 변수 정리 (선택적)
-                for var in ["MASTER_ADDR", "MASTER_PORT", "RANK", "WORLD_SIZE", "LOCAL_RANK"]:
+                # 환경 변수 정리
+                env_vars_to_clean = ["MASTER_ADDR", "MASTER_PORT", "RANK", "WORLD_SIZE", "LOCAL_RANK"]
+                cleaned_vars = []
+
+                for var in env_vars_to_clean:
                     if var in os.environ:
                         del os.environ[var]
-                logger.info("분산 환경 변수가 정리되었습니다.")
+                        cleaned_vars.append(var)
+
+                if cleaned_vars:
+                    logger.info(
+                        "Cleaned environment variables",
+                        context={"shutdown": {"cleaned_vars": cleaned_vars}}
+                    )
+
+                logger.info(
+                    "Distributed shutdown completed",
+                    context={"shutdown": {"status": "completed"}}
+                )
 
     def _validate_and_set_defaults(self,
                                    tensor_parallel_size, pipeline_parallel_size,
@@ -226,43 +334,102 @@ class DistributedVLLMEngine:
                                    swap_space, trust_remote_code,
                                    dtype, enforce_eager):
         """설정값 검증 및 기본값 설정"""
+        # 구조화된 컨텍스트 준비
+        validation_context = {"validation": {"component": "distributed_engine"}}
+
         # 텐서 병렬 크기 검증은 별도 메서드에서 수행
         self._validate_tensor_parallel_size(tensor_parallel_size)
 
         # 파이프라인 병렬 크기
         self.pipeline_parallel_size = pipeline_parallel_size or config.engine.pipeline_parallel_size
         if self.pipeline_parallel_size < 1:
-            logger.warning(f"잘못된 pipeline_parallel_size: {self.pipeline_parallel_size}. 1로 설정합니다.")
+            logger.warning(
+                f"Invalid pipeline_parallel_size: {self.pipeline_parallel_size}. Setting to 1",
+                context={
+                    "validation": {
+                        "parameter": "pipeline_parallel_size",
+                        "invalid_value": self.pipeline_parallel_size,
+                        "corrected_value": 1
+                    }
+                }
+            )
             self.pipeline_parallel_size = 1
 
         # GPU 메모리 사용률
         self.gpu_memory_utilization = gpu_memory_utilization or config.engine.gpu_memory_utilization
         if not (0.0 < self.gpu_memory_utilization <= 1.0):
-            logger.warning(f"잘못된 gpu_memory_utilization: {self.gpu_memory_utilization}. 0.9로 설정합니다.")
+            logger.warning(
+                f"Invalid gpu_memory_utilization: {self.gpu_memory_utilization}. Setting to 0.9",
+                context={
+                    "validation": {
+                        "parameter": "gpu_memory_utilization",
+                        "invalid_value": self.gpu_memory_utilization,
+                        "corrected_value": 0.9
+                    }
+                }
+            )
             self.gpu_memory_utilization = 0.9
 
         # 최대 모델 ~
         self.max_model_len = max_model_len or config.engine.max_model_len
-        if self.max_model_len < 1:
-            logger.warning(f"잘못된 max_model_len: {self.max_model_len}.")
+        if self.max_model_len is not None and self.max_model_len < 1:
+            logger.warning(
+                f"Invalid max_model_len: {self.max_model_len}",
+                context={
+                    "validation": {
+                        "parameter": "max_model_len",
+                        "invalid_value": self.max_model_len
+                    }
+                }
+            )
 
         # 최대 시퀀스 수
         self.max_num_seqs = max_num_seqs or config.engine.max_num_seqs
         if self.max_num_seqs < 1:
-            logger.warning(f"잘못된 max_num_seqs: {self.max_num_seqs}. 256으로 설정합니다.")
-            self.max_num_seqs = 256
+            default_value = 256
+            logger.warning(
+                f"Invalid max_num_seqs: {self.max_num_seqs}. Setting to {default_value}",
+                context={
+                    "validation": {
+                        "parameter": "max_num_seqs",
+                        "invalid_value": self.max_num_seqs,
+                        "corrected_value": default_value
+                    }
+                }
+            )
+            self.max_num_seqs = default_value
 
         # 최대 배치 토큰 수
         self.max_num_batched_tokens = max_num_batched_tokens or config.engine.max_num_batched_tokens
         if self.max_num_batched_tokens < 1:
-            logger.warning(f"잘못된 max_num_batched_tokens: {self.max_num_batched_tokens}. 8192로 설정합니다.")
-            self.max_num_batched_tokens = 8192
+            default_value = 8192
+            logger.warning(
+                f"Invalid max_num_batched_tokens: {self.max_num_batched_tokens}. Setting to {default_value}",
+                context={
+                    "validation": {
+                        "parameter": "max_num_batched_tokens",
+                        "invalid_value": self.max_num_batched_tokens,
+                        "corrected_value": default_value
+                    }
+                }
+            )
+            self.max_num_batched_tokens = default_value
 
         # 스왑 공간
         self.swap_space = swap_space or config.engine.swap_space
         if self.swap_space < 0:
-            logger.warning(f"잘못된 swap_space: {self.swap_space}. 4로 설정합니다.")
-            self.swap_space = 4
+            default_value = 4
+            logger.warning(
+                f"Invalid swap_space: {self.swap_space}. Setting to {default_value}",
+                context={
+                    "validation": {
+                        "parameter": "swap_space",
+                        "invalid_value": self.swap_space,
+                        "corrected_value": default_value
+                    }
+                }
+            )
+            self.swap_space = default_value
 
         # 원격 코드 신뢰 여부
         self.trust_remote_code = trust_remote_code if trust_remote_code is not None else config.model.trust_remote_code
@@ -271,8 +438,19 @@ class DistributedVLLMEngine:
         valid_dtypes = {"auto", "float16", "bfloat16", "float32"}
         self.dtype = dtype or config.engine.dtype
         if self.dtype not in valid_dtypes:
-            logger.warning(f"잘못된 dtype: {self.dtype}. 'auto'로 설정합니다.")
-            self.dtype = "auto"
+            default_dtype = "auto"
+            logger.warning(
+                f"Invalid dtype: {self.dtype}. Setting to '{default_dtype}'",
+                context={
+                    "validation": {
+                        "parameter": "dtype",
+                        "invalid_value": self.dtype,
+                        "corrected_value": default_dtype,
+                        "valid_options": list(valid_dtypes)
+                    }
+                }
+            )
+            self.dtype = default_dtype
 
         # Eager 모드 강제 실행 여부
         self.enforce_eager = enforce_eager if enforce_eager is not None else config.engine.enforce_eager
@@ -285,8 +463,24 @@ class DistributedVLLMEngine:
             self.quantization = quantization
 
         if self.quantization not in valid_quantization:
-            logger.warning(f"지원하지 않는 quantization: {self.quantization}. None으로 설정합니다.")
+            logger.warning(
+                f"Unsupported quantization: {self.quantization}. Setting to None",
+                context={
+                    "validation": {
+                        "parameter": "quantization",
+                        "invalid_value": self.quantization,
+                        "corrected_value": None,
+                        "valid_options": list(valid_quantization)
+                    }
+                }
+            )
             self.quantization = None
+
+        if self.is_master:
+            logger.debug(
+                "Parameter validation completed",
+                context=validation_context
+            )
 
     def _setup_gpu(self):
         """GPU 설정 및 확인"""
@@ -298,13 +492,35 @@ class DistributedVLLMEngine:
             num_gpus = torch.cuda.device_count()
 
             if self.is_master:
-                logger.info(f"Using distributed mode with {self.world_size} processes")
                 logger.info(
-                    f"Process {self.rank} using GPU {self.local_rank}: {torch.cuda.get_device_name(self.local_rank)}")
-                logger.info(f"Number of GPUs per node: {num_gpus}")
+                    f"Using distributed mode",
+                    context={
+                        "distributed": {
+                            "processes": self.world_size,
+                            "gpus_per_node": num_gpus
+                        }
+                    }
+                )
+
+            # 각 프로세스의 GPU 할당 정보
+            gpu_name = torch.cuda.get_device_name(self.local_rank)
+            logger.info(
+                f"Process using GPU",
+                context={
+                    "process": {
+                        "rank": self.rank,
+                        "local_rank": self.local_rank,
+                        "gpu_name": gpu_name
+                    }
+                }
+            )
+
             return num_gpus
         else:
-            logger.warning("No GPU available, using CPU. Performance will be significantly degraded.")
+            logger.warning(
+                "No GPU available, using CPU. Performance will be significantly degraded.",
+                context={"hardware": {"is_cuda_available": False}}
+            )
             return 0
 
     def _compute_tensor_parallel_size(self, tensor_parallel_size):
@@ -313,7 +529,15 @@ class DistributedVLLMEngine:
         if tensor_parallel_size is None:
             # 텐서 병렬 크기 = min(노드당 GPU 수, 8)
             tensor_parallel_size = min(self.num_gpus if self.num_gpus > 0 else 1, 8)
-            logger.info(f"자동 설정된 텐서 병렬 크기: {tensor_parallel_size}")
+            logger.info(
+                f"Automatically set tensor parallel size",
+                context={
+                    "distributed": {
+                        "tensor_parallel_size": tensor_parallel_size,
+                        "auto_configured": True
+                    }
+                }
+            )
 
         # 병렬 크기 유효성 검사 수행
         tensor_parallel_size = self._validate_tensor_parallel_size(tensor_parallel_size)
@@ -321,23 +545,60 @@ class DistributedVLLMEngine:
 
     def _validate_tensor_parallel_size(self, tensor_parallel_size):
         """텐서 병렬 크기 유효성 검사"""
+        validation_context = {
+            "validation": {
+                "parameter": "tensor_parallel_size",
+                "original_value": tensor_parallel_size
+            }
+        }
+
         # 텐서 병렬 크기가 정수인지 확인
         try:
             tensor_parallel_size = int(tensor_parallel_size)
+            validation_context["validation"]["parsed_value"] = tensor_parallel_size
         except (ValueError, TypeError):
-            logger.warning(f"텐서 병렬 크기는 정수여야 합니다. 입력값: {tensor_parallel_size}, 기본값 1로 설정합니다.")
+            logger.warning(
+                f"Tensor parallel size must be an integer",
+                context={
+                    "validation": {
+                        "parameter": "tensor_parallel_size",
+                        "invalid_value": tensor_parallel_size,
+                        "corrected_value": 1,
+                        "reason": "not_an_integer"
+                    }
+                }
+            )
             return 1
 
         # 텐서 병렬 크기가 1보다 작은 경우
         if tensor_parallel_size < 1:
-            logger.warning(f"텐서 병렬 크기는 최소 1 이상이어야 합니다. 입력값: {tensor_parallel_size}, 기본값 1로 설정합니다.")
+            logger.warning(
+                f"Tensor parallel size must be at least 1",
+                context={
+                    "validation": {
+                        "parameter": "tensor_parallel_size",
+                        "invalid_value": tensor_parallel_size,
+                        "corrected_value": 1,
+                        "reason": "less_than_one"
+                    }
+                }
+            )
             return 1
 
         # 텐서 병렬 크기가 GPU 수보다 큰 경우
         if 0 < self.num_gpus < tensor_parallel_size:
             logger.warning(
-                f"요청한 텐서 병렬 크기({tensor_parallel_size})가 사용 가능한 GPU 수({self.num_gpus})보다 큽니다.")
-            logger.warning(f"텐서 병렬 크기를 {self.num_gpus}로 조정합니다.")
+                f"Requested tensor parallel size exceeds available GPUs",
+                context={
+                    "validation": {
+                        "parameter": "tensor_parallel_size",
+                        "requested_value": tensor_parallel_size,
+                        "available_gpus": self.num_gpus,
+                        "corrected_value": self.num_gpus,
+                        "reason": "exceeds_available_gpus"
+                    }
+                }
+            )
             return self.num_gpus
 
         # 텐서 병렬 크기가 2의 거듭제곱인지 확인
@@ -348,29 +609,61 @@ class DistributedVLLMEngine:
                 next_power *= 2
 
             logger.warning(
-                f"최적의 성능을 위해 텐서 병렬 크기는 2의 거듭제곱(2, 4, 8...)이어야 합니다. "
-                f"입력값: {tensor_parallel_size}, {next_power}로 조정합니다.")
+                f"Tensor parallel size should be a power of 2 for optimal performance",
+                context={
+                    "validation": {
+                        "parameter": "tensor_parallel_size",
+                        "requested_value": tensor_parallel_size,
+                        "corrected_value": next_power,
+                        "reason": "not_power_of_two"
+                    }
+                }
+            )
             return next_power
 
         # 텐서 병렬 크기가 너무 큰 경우 (일반적으로 16 이상은 성능 저하 가능성)
         if tensor_parallel_size > 16:
             logger.warning(
-                f"텐서 병렬 크기가 매우 큽니다({tensor_parallel_size}). "
-                f"이는 통신 오버헤드로 인해 성능 저하를 초래할 수 있습니다.")
+                f"Very large tensor parallel size may cause performance degradation",
+                context={
+                    "validation": {
+                        "parameter": "tensor_parallel_size",
+                        "value": tensor_parallel_size,
+                        "recommended_max": 16,
+                        "concern": "performance_overhead"
+                    }
+                }
+            )
 
         # 텐서 병렬 크기가 세계 크기(world_size)에 나누어 떨어지는지 확인
         if self.world_size % tensor_parallel_size != 0:
             logger.warning(
-                f"텐서 병렬 크기({tensor_parallel_size})가 세계 크기({self.world_size})의 약수가 아닙니다. "
-                f"이는 일부 프로세스가 사용되지 않을 수 있습니다.")
+                f"Tensor parallel size is not a divisor of world size",
+                context={
+                    "validation": {
+                        "parameter": "tensor_parallel_size",
+                        "value": tensor_parallel_size,
+                        "world_size": self.world_size,
+                        "concern": "uneven_distribution"
+                    }
+                }
+            )
 
         # 모든 검증을 통과한 경우
-        logger.info(f"검증된 텐서 병렬 크기: {tensor_parallel_size}")
+        logger.info(
+            f"Validated tensor parallel size",
+            context={
+                "distributed": {
+                    "tensor_parallel_size": tensor_parallel_size,
+                    "validation": "passed"
+                }
+            }
+        )
         return tensor_parallel_size
 
     def _create_engine_args(self):
         """vLLM 엔진 인자 생성"""
-        return AsyncEngineArgs(
+        engine_args = AsyncEngineArgs(
             model=self.model_name,
             tensor_parallel_size=self.tensor_parallel_size,
             pipeline_parallel_size=self.pipeline_parallel_size,
@@ -386,19 +679,41 @@ class DistributedVLLMEngine:
             block_size=config.engine.block_size
         )
 
+        logger.debug(
+            "Created engine arguments",
+            context={
+                "engine_creation": {
+                    "model": self.model_name,
+                    "tensor_parallel_size": self.tensor_parallel_size,
+                    "pipeline_parallel_size": self.pipeline_parallel_size
+                }
+            }
+        )
+
+        return engine_args
+
     def _log_initialization_params(self):
         """초기화 매개변수 로깅"""
-        logger.info(f"Initializing distributed vLLM engine with {self.model_name}")
-        logger.debug(f"Tensor parallel size: {self.tensor_parallel_size}")
-        logger.debug(f"Pipeline parallel size: {self.pipeline_parallel_size}")
-        logger.debug(f"GPU memory utilization: {self.gpu_memory_utilization}")
-        logger.debug(f"Max model length: {self.max_model_len}")
-        logger.debug(f"Max num sequences: {self.max_num_seqs}")
-        logger.debug(f"Max num batched tokens: {self.max_num_batched_tokens}")
-        logger.debug(f"Quantization: {self.quantization}")
-        logger.debug(f"Swap space: {self.swap_space} GB")
-        logger.debug(f"Dtype: {self.dtype}")
-        logger.debug(f"Enforce eager: {self.enforce_eager}")
+        # 상세 설정 정보를 구조화된 형태로 로깅
+        init_params = {
+            "model": self.model_name,
+            "tensor_parallel_size": self.tensor_parallel_size,
+            "pipeline_parallel_size": self.pipeline_parallel_size,
+            "gpu_memory_utilization": self.gpu_memory_utilization,
+            "max_model_len": self.max_model_len,
+            "max_num_seqs": self.max_num_seqs,
+            "max_num_batched_tokens": self.max_num_batched_tokens,
+            "quantization": self.quantization,
+            "swap_space": self.swap_space,
+            "dtype": self.dtype,
+            "enforce_eager": self.enforce_eager,
+            "block_size": config.engine.block_size
+        }
+
+        logger.info(
+            "Distributed engine configuration",
+            context={"initialization": {"parameters": init_params}}
+        )
 
     def _init_distributed(self):
         """분산 환경 초기화"""
@@ -408,18 +723,43 @@ class DistributedVLLMEngine:
             return
 
         # 분산 환경 변수 설정
-        os.environ["MASTER_ADDR"] = self.dist_config.master_addr
-        os.environ["MASTER_PORT"] = self.dist_config.master_port
-        os.environ["WORLD_SIZE"] = str(self.dist_config.world_size)
-        os.environ["RANK"] = str(self.dist_config.rank)
-        os.environ["LOCAL_RANK"] = str(self.dist_config.local_rank)
+        env_vars = {
+            "MASTER_ADDR": self.dist_config.master_addr,
+            "MASTER_PORT": self.dist_config.master_port,
+            "WORLD_SIZE": str(self.dist_config.world_size),
+            "RANK": str(self.dist_config.rank),
+            "LOCAL_RANK": str(self.dist_config.local_rank)
+        }
+
+        # 환경 변수 설정 로깅
+        logger.debug(
+            "Setting distributed environment variables",
+            context={"distributed": {"env_vars": env_vars}}
+        )
+
+        # 환경 변수 적용
+        for key, value in env_vars.items():
+            os.environ[key] = value
 
         # 분산 환경 초기화 시도
-        with TimingContext(logger, "Distributed init") as timing:
+        with TimingContext(logger, "Distributed initialization") as timing:
             try:
-                with profile_block("distributed_init"):  # 프로파일링 블록 추가
-                    logger.info(
-                        f"Initializing distributed environment (rank={self.rank}, world_size={self.world_size})")
+                init_context = {
+                    "distributed": {
+                        "rank": self.rank,
+                        "world_size": self.world_size,
+                        "backend": self.dist_config.backend,
+                        "init_method": self._get_init_method(),
+                        "timeout_seconds": self.dist_config.timeout
+                    }
+                }
+
+                logger.info(
+                    "Initializing distributed environment",
+                    context=init_context
+                )
+
+                with profile_block("distributed_init"):
                     dist.init_process_group(
                         backend=self.dist_config.backend,
                         init_method=self._get_init_method(),
@@ -427,18 +767,50 @@ class DistributedVLLMEngine:
                         rank=self.rank,
                         timeout=datetime.timedelta(seconds=self.dist_config.timeout)
                     )
-                logger.info(f"Distributed environment initialized successfully in {timing.duration:.2f}s")
+
+                logger.info(
+                    "Distributed environment initialized successfully",
+                    context={
+                        "distributed": {
+                            "initialization": {
+                                "status": "success",
+                                "duration_seconds": timing.duration
+                            }
+                        }
+                    }
+                )
             except Exception as e:
-                logger.error(f"Failed to initialize distributed environment: {str(e)}", exc_info=True)
+                logger.error(
+                    "Failed to initialize distributed environment",
+                    context={
+                        "distributed": {
+                            "initialization": {
+                                "status": "failed",
+                                "error_type": type(e).__name__,
+                                "error_message": str(e)
+                            }
+                        }
+                    },
+                    exc_info=True
+                )
                 raise
 
     def _get_init_method(self) -> str:
         """분산 초기화 방법 문자열 생성"""
         if self.dist_config.init_method:
+            logger.debug(
+                "Using explicit init_method",
+                context={"distributed": {"init_method": self.dist_config.init_method}}
+            )
             return self.dist_config.init_method
 
         # 기본값: TCP 초기화 방법
-        return f"tcp://{self.dist_config.master_addr}:{self.dist_config.master_port}"
+        init_method = f"tcp://{self.dist_config.master_addr}:{self.dist_config.master_port}"
+        logger.debug(
+            "Using TCP init_method",
+            context={"distributed": {"init_method": init_method}}
+        )
+        return init_method
 
     def _sync_distributed(self):
         """분산 환경 동기화"""
@@ -450,12 +822,35 @@ class DistributedVLLMEngine:
                 try:
                     dist.barrier()
                     if self.is_master:
-                        logger.info(f"Distributed processes synchronized in {timing.duration:.2f}s")
+                        logger.info(
+                            "Distributed processes synchronized",
+                            context={
+                                "distributed": {
+                                    "synchronization": {
+                                        "status": "success",
+                                        "duration_seconds": timing.duration
+                                    }
+                                }
+                            }
+                        )
                 except Exception as e:
-                    logger.error(f"Error during distributed synchronization: {str(e)}", exc_info=True)
+                    logger.error(
+                        "Error during distributed synchronization",
+                        context={
+                            "distributed": {
+                                "synchronization": {
+                                    "status": "failed",
+                                    "error_type": type(e).__name__,
+                                    "error_message": str(e)
+                                }
+                            }
+                        },
+                        exc_info=True
+                    )
                     raise
 
     @profile
+    @with_request_context
     async def generate(self, req_config: RequestConfig) -> Union[Dict[str, Any], AsyncGenerator[Dict[str, Any], None]]:
         """
         텍스트 생성 요청 처리
@@ -483,18 +878,35 @@ class DistributedVLLMEngine:
                 "prompt_tokens": 0
             }
 
+        # 요청 컨텍스트 설정 - 구조화된 로깅 활용
+        logger.set_request_id(request_id)
+        logger.with_context(
+            distributed=True,
+            is_master=self.is_master,
+            rank=self.rank
+        )
+
+        # 요청 정보 로깅 - 마스터 노드에서만 INFO 수준으로
+        log_method = logger.info if self.is_master else logger.debug
+        log_method(
+            "Request received",
+            context={
+                "request": {
+                    "id": request_id,
+                    "prompt_length": len(req_config.prompt),
+                    "max_tokens": req_config.max_tokens,
+                    "stream": req_config.stream
+                }
+            }
+        )
+
         # 메트릭 수집기 가져오기 (마스터 노드에서만 메트릭 수집)
         metrics_collector = None
         if config.monitoring.enabled:
             metrics_collector = get_metrics_collector() if self.is_master else None
-            # 요청 처리 시작 기록
             # 마스터 노드의 경우 메트릭 수집 시작
             if self.is_master and metrics_collector:
                 metrics_collector.start_request(request_id)
-
-        # 추론 시작 로깅
-        logger.info(f"Request {request_id} received: prompt length={len(req_config.prompt)}, "
-                    f"max_tokens={req_config.max_tokens}, temperature={req_config.temperature}")
 
         # 스레드 안전을 위한 락 획득 (요청 카운터 업데이트 시)
         async with self._request_lock:
@@ -504,7 +916,7 @@ class DistributedVLLMEngine:
             self.request_metrics[request_id]["status"] = "processing"
 
         # 타이밍 컨텍스트 시작
-        timing = TimingContext(logger, f"Request {request_id} processing")
+        timing = TimingContext(logger, "Request processing")
 
         # 요청 처리 및 오류 처리
         try:
@@ -518,7 +930,10 @@ class DistributedVLLMEngine:
 
             # 스트리밍 모드인 경우
             if req_config.stream:
-                logger.debug(f"Starting streaming response for request {request_id}")
+                log_method(
+                    "Starting streaming response",
+                    context={"request": {"mode": "streaming"}}
+                )
                 with profile_block(f"stream_request_{request_id}"):
                     return self._stream_generator(engine_request, sampling_params, timing, metrics_collector)
 
@@ -534,8 +949,11 @@ class DistributedVLLMEngine:
 
             # 결과 확인
             if result is None:
-                error_msg = f"No result generated for request {request_id}"
-                logger.error(error_msg)
+                error_msg = "No result generated for request"
+                logger.error(
+                    error_msg,
+                    context={"request": {"status": "failed", "reason": "empty_result"}}
+                )
                 if self.is_master and metrics_collector:
                     metrics_collector.fail_request(request_id, error_msg)
                 raise RuntimeError(error_msg)
@@ -569,12 +987,19 @@ class DistributedVLLMEngine:
                         prompt_tokens=prompt_tokens
                     )
 
-            # 통계 로깅
+            # 통계 로깅 - 구조화된 형식으로
             if self.is_master:
-                logger.info(
-                    f"Request {request_id} completed: {prompt_tokens} prompt tokens, "
-                    f"{completion_tokens} completion tokens in {timing.duration:.3f}s "
-                    f"({tokens_per_second:.2f} tokens/sec)"
+                log_method(
+                    "Request completed",
+                    context={
+                        "performance": {
+                            "prompt_tokens": prompt_tokens,
+                            "completion_tokens": completion_tokens,
+                            "total_tokens": total_tokens,
+                            "duration_seconds": timing.duration,
+                            "tokens_per_second": tokens_per_second
+                        }
+                    }
                 )
 
             return {
@@ -593,7 +1018,20 @@ class DistributedVLLMEngine:
             }
 
         except Exception as e:
-            logger.error(f"Error processing request {request_id}: {str(e)}", exc_info=True)
+            logger.error(
+                "Error processing request",
+                context={
+                    "request": {
+                        "id": request_id,
+                        "status": "failed"
+                    },
+                    "error": {
+                        "type": type(e).__name__,
+                        "message": str(e)
+                    }
+                },
+                exc_info=True
+            )
             # 마스터 노드의 경우 메트릭 수집기에 실패 기록
             if self.is_master and metrics_collector:
                 metrics_collector.fail_request(request_id, str(e))
@@ -620,27 +1058,82 @@ class DistributedVLLMEngine:
                     ]
                     # 삭제할 요청 수 계산 (전체의 20%)
                     remove_count = min(len(completed_requests), 200)
+                    if remove_count > 0:
+                        logger.debug(
+                            "Cleaning up old request metrics",
+                            context={
+                                "cleanup": {
+                                    "total_metrics": len(self.request_metrics),
+                                    "removing_count": remove_count
+                                }
+                            }
+                        )
                     for req_id in sorted(completed_requests,
                                          key=lambda x: self.request_metrics[x].get("end_time", 0))[:remove_count]:
                         del self.request_metrics[req_id]
 
+            # 요청 컨텍스트 정리
+            logger.clear_context()
+            logger.set_request_id(None)
+
     @classmethod
     def _validate_request_config(cls, req_config: RequestConfig):
         """요청 설정 검증"""
+
         if not req_config.prompt:
-            raise ValueError("프롬프트가 비어 있습니다.")
+            error_msg = "Prompt is empty"
+            logger.error(
+                error_msg,
+                context={
+                    "validation": {
+                        "parameter": "prompt",
+                        "status": "failed",
+                        "reason": "empty_prompt"
+                    }
+                }
+            )
+            raise ValueError(error_msg)
 
         if req_config.max_tokens is not None and req_config.max_tokens <= 0:
-            logger.warning(f"잘못된 max_tokens: {req_config.max_tokens}. 기본값 사용.")
+            logger.warning(
+                f"Invalid max_tokens: {req_config.max_tokens}. Using default value.",
+                context={
+                    "validation": {
+                        "parameter": "max_tokens",
+                        "invalid_value": req_config.max_tokens,
+                        "action": "using_default"
+                    }
+                }
+            )
             req_config.max_tokens = config.inference.max_tokens
 
         if req_config.temperature is not None and req_config.temperature < 0:
-            logger.warning(f"잘못된 temperature: {req_config.temperature}. 기본값 사용.")
+            logger.warning(
+                f"Invalid temperature: {req_config.temperature}. Using default value.",
+                context={
+                    "validation": {
+                        "parameter": "temperature",
+                        "invalid_value": req_config.temperature,
+                        "action": "using_default"
+                    }
+                }
+            )
             req_config.temperature = config.inference.temperature
 
     @classmethod
     def _create_engine_request(cls, req_config: RequestConfig) -> RequestConfig:
         """엔진 요청 객체 생성"""
+        logger.debug(
+            "Creating engine request",
+            context={
+                "request": {
+                    "id": req_config.request_id,
+                    "max_tokens": req_config.max_tokens,
+                    "temperature": req_config.temperature
+                }
+            }
+        )
+
         return RequestConfig(
             prompt=req_config.prompt,
             max_tokens=req_config.max_tokens,
@@ -678,6 +1171,9 @@ class DistributedVLLMEngine:
         previous_text_length = 0  # 이전 텍스트 길이 추적용 변수
         is_first_response = True  # 첫 번째 응답 여부 체크
 
+        # 스트리밍 컨텍스트 추가
+        logger.with_context(streaming=True)
+
         # 배치 처리 관련 변수
         batch_size_chars = 20  # 약 5-10개 토큰에 해당 (한글은 대략 2-3자가 1토큰)
         batch_max_wait_time = 0.1  # 최대 대기 시간 (초)
@@ -686,6 +1182,17 @@ class DistributedVLLMEngine:
 
         # 타이밍 시작
         timing.__enter__()
+
+        logger.debug(
+            "Stream generation started",
+            context={
+                "streaming": {
+                    "request_id": request_id,
+                    "batch_size_chars": batch_size_chars,
+                    "batch_max_wait_time": batch_max_wait_time
+                }
+            }
+        )
 
         try:
             async for result in self.engine.generate(
@@ -701,6 +1208,18 @@ class DistributedVLLMEngine:
                 current_text = output.text
                 new_text = current_text[previous_text_length:]
                 previous_text_length = len(current_text)
+
+                # 디버그 로깅 - 상세하지만 TRACE 수준 정보는 조건부로
+                if config.logging.level.upper() == "DEBUG" and tokens_generated % 10 == 0:  # 10토큰마다 로깅
+                    logger.debug(
+                        "Stream progress",
+                        context={
+                            "streaming": {
+                                "tokens_generated": tokens_generated,
+                                "new_text_length": len(new_text)
+                            }
+                        }
+                    )
 
                 # 새 텍스트를 현재 배치에 추가
                 current_batch += new_text
@@ -728,6 +1247,19 @@ class DistributedVLLMEngine:
                     if is_first_response or is_finished:
                         response["generated_text"] = current_text
                         is_first_response = False
+
+                    # 배치 전송 로깅 - TRACE 수준으로 간주하고 DEBUG에서만 상세 정보
+                    if config.logging.level.upper() == "DEBUG":
+                        logger.debug(
+                            "Sending stream batch",
+                            context={
+                                "streaming": {
+                                    "batch_size": len(current_batch),
+                                    "is_first": is_first_response,
+                                    "is_finished": is_finished
+                                }
+                            }
+                        )
 
                     # 배치 전송
                     yield response
@@ -759,16 +1291,32 @@ class DistributedVLLMEngine:
                             prompt_tokens=prompt_tokens
                         )
 
-                    # 로깅
-                    if self.is_master:
-                        tokens_per_second = tokens_generated / timing.duration if timing.duration > 0 else 0
-                        logger.info(
-                            f"Streaming request {request_id} completed: {tokens_generated} tokens in "
-                            f"{timing.duration:.3f}s ({tokens_per_second:.2f} tokens/sec)"
-                        )
+                    # 로깅 - 구조화된 형식
+                    tokens_per_second = tokens_generated / timing.duration if timing.duration > 0 else 0
+                    logger.info(
+                        "Streaming request completed",
+                        context={
+                            "performance": {
+                                "tokens_generated": tokens_generated,
+                                "prompt_tokens": prompt_tokens,
+                                "duration_seconds": timing.duration,
+                                "tokens_per_second": tokens_per_second
+                            }
+                        }
+                    )
 
         except Exception as e:
-            logger.error(f"Error in stream generation for request {request_id}: {str(e)}", exc_info=True)
+            logger.error(
+                "Error in stream generation",
+                context={
+                    "error": {
+                        "type": type(e).__name__,
+                        "message": str(e),
+                        "request_id": request_id
+                    }
+                },
+                exc_info=True
+            )
 
             # 메트릭 업데이트 (lock 보호)
             async with self._request_lock:
@@ -797,3 +1345,6 @@ class DistributedVLLMEngine:
             async with self._request_lock:
                 if self.request_metrics[request_id]["status"] == "processing":
                     self.active_requests -= 1
+
+            # 스트리밍 컨텍스트 정리
+            logger.with_context(streaming=False)

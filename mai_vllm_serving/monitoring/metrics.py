@@ -3,13 +3,10 @@ mai-vllm-serving의 모니터링 지표 모듈
 성능, 리소스 사용량, 요청 처리 등에 관한 지표를 수집하고 관리
 """
 
-import asyncio
 import functools
-import json
 import statistics
 import threading
 import time
-import uuid
 from collections import deque, Counter
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
@@ -17,6 +14,8 @@ from typing import Dict, List, Optional, Any, Deque
 
 import psutil
 import torch
+
+from mai_vllm_serving.utils.logging_utils import with_logging_context
 
 try:
     import GPUtil
@@ -36,18 +35,17 @@ except ImportError:
 
 # 설정 모듈 임포트
 from mai_vllm_serving.utils.config import get_config
-from mai_vllm_serving.utils.logging_utils import setup_logging
+# 구조화 로깅 임포트
+from mai_vllm_serving.utils.logging_utils import (
+    get_logger,
+    TimingContext
+)
 
 # 설정 객체 가져오기
 config = get_config()
 
-# 로깅 초기화
-logger = setup_logging(
-    service_name="mai-vllm-serving-metrics",
-    log_level=config.logging.level,
-    use_json=config.logging.json,
-    log_file=config.logging.file
-)
+# 구조화된 로거 가져오기
+logger = get_logger("metrics")
 
 
 @dataclass
@@ -100,11 +98,28 @@ class RequestMetrics:
         self.completion_time = self.total_time - self.prompt_processing_time - self.queue_time
         self.status = "completed"
 
+        # 로깅을 위한 정보 준비
+        tokens_per_second = self.tokens_per_second
+        total_time = self.total_time
+
+        return {
+            "completion_tokens": completion_tokens,
+            "prompt_tokens": self.prompt_tokens,
+            "total_tokens": self.total_tokens,
+            "total_time": total_time,
+            "tokens_per_second": tokens_per_second
+        }
+
     def fail(self, error: str) -> None:
         """요청 실패 처리"""
         self.end_time = time.time()
         self.error = error
         self.status = "failed"
+
+        return {
+            "error": error,
+            "total_time": self.total_time
+        }
 
 
 @dataclass
@@ -156,7 +171,13 @@ class SystemMetrics:
                     }
                     metrics.gpu_metrics.append(gpu_metrics)
             except Exception as e:
-                logger.warning(f"Failed to collect GPU metrics: {str(e)}")
+                logger.warning(
+                    "GPUtil 메트릭 수집 실패",
+                    context={
+                        "error": str(e),
+                        "component": "SystemMetrics.collect"
+                    }
+                )
 
         # PyTorch CUDA 정보
         if torch.cuda.is_available():
@@ -174,7 +195,14 @@ class SystemMetrics:
                     else:
                         metrics.gpu_metrics.append(gpu_metrics)
                 except Exception as e:
-                    logger.warning(f"Failed to collect PyTorch CUDA metrics for GPU {i}: {str(e)}")
+                    logger.warning(
+                        f"PyTorch CUDA 메트릭 수집 실패 (GPU {i})",
+                        context={
+                            "error": str(e),
+                            "gpu_id": i,
+                            "component": "SystemMetrics.collect"
+                        }
+                    )
 
         return metrics
 
@@ -234,16 +262,37 @@ class MetricsCollector:
         # 메트릭 초기화 상태 추적을 위한 변수 추가
         self._metrics_initialized = False
 
+        # 초기화 로깅
+        logger.info(
+            "메트릭 수집기 초기화",
+            context={
+                "max_history": max_history,
+                "enable_prometheus": self.enable_prometheus,
+                "prometheus_port": prometheus_port,
+                "log_interval": log_interval,
+            }
+        )
+
         # 프로메테우스 설정
         if self.enable_prometheus:
-            self._setup_prometheus_metrics()
-            start_prometheus_server(self.prometheus_port)
-            logger.info(f"Prometheus metrics server started on port {self.prometheus_port}")
+            with TimingContext(logger, "Prometheus 메트릭 초기화") as timing:
+                self._setup_prometheus_metrics()
+                start_prometheus_server(self.prometheus_port)
+                logger.info(
+                    "Prometheus 메트릭 서버 시작됨",
+                    context={
+                        "port": self.prometheus_port,
+                        "init_time": timing.duration
+                    }
+                )
         else:
             if not HAS_PROMETHEUS:
-                logger.warning("Prometheus client library not installed. Prometheus metrics disabled.")
+                logger.warning(
+                    "Prometheus 클라이언트 라이브러리가 설치되지 않았습니다.",
+                    context={"feature": "prometheus_metrics"}
+                )
             else:
-                logger.info("Prometheus metrics disabled in configuration.")
+                logger.info("설정에 따라 Prometheus 메트릭이 비활성화되었습니다.")
 
     def _setup_prometheus_metrics(self) -> None:
         """프로메테우스 메트릭 설정"""
@@ -252,7 +301,7 @@ class MetricsCollector:
 
         # 이미 메트릭이 초기화되었는지 확인하는 클래스 변수 추가
         if hasattr(self, '_metrics_initialized') and self._metrics_initialized:
-            logger.info("Prometheus metrics already initialized, skipping registration")
+            logger.info("Prometheus 메트릭이 이미 초기화되었습니다.", context={"action": "skip_registration"})
             return
 
         try:
@@ -306,12 +355,24 @@ class MetricsCollector:
 
             # 성공적으로 초기화되었음을 표시
             self._metrics_initialized = True
-            logger.info("Prometheus metrics successfully initialized")
+            logger.info(
+                "Prometheus 메트릭 초기화 완료",
+                context={
+                    "metrics_count": len(self.prometheus_metrics),
+                    "metrics": list(self.prometheus_metrics.keys())
+                }
+            )
 
         except ValueError as e:
             # 중복 등록 오류 처리
             if "Duplicated timeseries" in str(e):
-                logger.warning(f"Prometheus metrics already registered: {str(e)}")
+                logger.warning(
+                    "Prometheus 메트릭이 이미 등록되어 있습니다.",
+                    context={
+                        "error": str(e),
+                        "action": "using_existing_metrics"
+                    }
+                )
                 self._metrics_initialized = True
                 # 이미 등록된 메트릭 사용하기 위한 방법 (선택적)
                 from prometheus_client import REGISTRY
@@ -324,13 +385,20 @@ class MetricsCollector:
                             self.prometheus_metrics[name] = metric
             else:
                 # 다른 오류는 그대로 발생시킴
-                logger.error(f"Error initializing Prometheus metrics: {str(e)}")
+                logger.error(
+                    "Prometheus 메트릭 초기화 중 오류 발생",
+                    context={
+                        "error_type": type(e).__name__,
+                        "error": str(e)
+                    },
+                    exc_info=True
+                )
                 raise
 
     def start_collection(self) -> None:
         """메트릭 수집 스레드 시작"""
         if self._collection_thread is not None and self._collection_thread.is_alive():
-            logger.warning("Metrics collection thread is already running")
+            logger.warning("메트릭 수집 스레드가 이미 실행 중입니다.")
             return
 
         self._stop_event.clear()
@@ -340,27 +408,35 @@ class MetricsCollector:
             name="MetricsCollectionThread"
         )
         self._collection_thread.start()
-        logger.info("Metrics collection thread started")
+        logger.info("메트릭 수집 스레드가 시작되었습니다.", context={"thread_name": self._collection_thread.name})
 
     def stop_collection(self) -> None:
         """메트릭 수집 스레드 중지"""
         if self._collection_thread is None or not self._collection_thread.is_alive():
-            logger.warning("Metrics collection thread is not running")
+            logger.warning("메트릭 수집 스레드가 실행 중이 아닙니다.")
             return
 
+        logger.info("메트릭 수집 스레드 중지 중...")
         self._stop_event.set()
         self._collection_thread.join(timeout=5.0)
         if self._collection_thread.is_alive():
-            logger.warning("Metrics collection thread did not terminate properly")
+            logger.warning(
+                "메트릭 수집 스레드가 정상적으로 종료되지 않았습니다.",
+                context={"thread_name": self._collection_thread.name}
+            )
         else:
-            logger.info("Metrics collection thread stopped")
+            logger.info("메트릭 수집 스레드가 정상적으로 종료되었습니다.")
 
     def _collection_loop(self) -> None:
         """메트릭 수집 루프"""
         last_log_time = time.time()
+        collection_count = 0
+
+        logger.info("메트릭 수집 루프 시작")
 
         while not self._stop_event.is_set():
             try:
+                collection_count += 1
                 # 시스템 메트릭 수집
                 system_metrics = SystemMetrics.collect()
                 with self.lock:
@@ -370,6 +446,18 @@ class MetricsCollector:
                 if self.enable_prometheus:
                     self._update_prometheus_system_metrics(system_metrics)
 
+                # 상세 디버그 로깅 (매 10회차마다)
+                if collection_count % 10 == 0:
+                    logger.debug(
+                        "시스템 메트릭 수집됨",
+                        context={
+                            "cpu_percent": system_metrics.cpu_percent,
+                            "ram_percent": system_metrics.ram_percent,
+                            "ram_used_gb": f"{system_metrics.ram_used_gb:.2f}",
+                            "gpu_count": len(system_metrics.gpu_metrics)
+                        }
+                    )
+
                 # 주기적 로깅
                 current_time = time.time()
                 if current_time - last_log_time >= self.log_interval:
@@ -377,14 +465,33 @@ class MetricsCollector:
                     last_log_time = current_time
 
                 # 완료된 요청 정리
-                self._cleanup_completed_requests()
+                cleaned_count = self._cleanup_completed_requests()
+                if cleaned_count > 0:
+                    logger.debug(
+                        "완료된 요청 정리됨",
+                        context={
+                            "cleaned_count": cleaned_count,
+                            "current_active": len(self.request_metrics),
+                            "history_size": len(self.request_history)
+                        }
+                    )
 
                 # 잠시 대기
                 time.sleep(1.0)
 
             except Exception as e:
-                logger.error(f"Error in metrics collection loop: {str(e)}", exc_info=True)
+                logger.error(
+                    "메트릭 수집 루프에서 오류 발생",
+                    context={
+                        "error_type": type(e).__name__,
+                        "error": str(e),
+                        "collection_count": collection_count
+                    },
+                    exc_info=True
+                )
                 time.sleep(5.0)  # 오류 발생 시 좀 더 오래 대기
+
+        logger.info("메트릭 수집 루프 종료")
 
     def _log_metrics(self) -> None:
         """현재 메트릭 정보 로깅"""
@@ -396,30 +503,62 @@ class MetricsCollector:
             # 시스템 메트릭 가져오기
             system_metrics = self.system_metrics_history[-1] if self.system_metrics_history else SystemMetrics.collect()
 
+            # GPU 정보 요약
+            gpu_summary = []
+            for gpu in system_metrics.gpu_metrics:
+                gpu_summary.append({
+                    "id": gpu["id"],
+                    "memory_percent": f"{gpu.get('memory_used_percent', 0):.1f}%",
+                    "utilization": f"{gpu.get('gpu_utilization', 0):.1f}%"
+                })
+
             # 로그 데이터 구성
-            log_data = {
-                "timestamp": datetime.now().isoformat(),
-                "uptime": time.time() - self.start_time,
-                "total_requests": self.total_requests,
-                "total_successes": self.total_successes,
-                "total_failures": self.total_failures,
-                "active_requests": len(self.request_metrics),
-                "total_tokens_input": self.total_tokens_input,
-                "total_tokens_output": self.total_tokens_output,
-                "avg_tokens_per_second": avg_tokens_per_second,
-                "avg_request_time": avg_request_time,
-                "system": {
-                    "cpu_percent": system_metrics.cpu_percent,
-                    "ram_percent": system_metrics.ram_percent,
-                    "gpu_metrics": system_metrics.gpu_metrics,
-                    "disk_percent": system_metrics.disk_percent
+            logger.info(
+                "성능 메트릭 요약",
+                context={
+                    "metrics": {
+                        "uptime": f"{time.time() - self.start_time:.1f}초",
+                        "requests": {
+                            "total": self.total_requests,
+                            "success": self.total_successes,
+                            "failure": self.total_failures,
+                            "active": len(self.request_metrics),
+                        },
+                        "tokens": {
+                            "input": self.total_tokens_input,
+                            "output": self.total_tokens_output,
+                            "per_second_avg": f"{avg_tokens_per_second:.1f}"
+                        },
+                        "latency": {
+                            "avg_request_time": f"{avg_request_time:.3f}초"
+                        },
+                        "system": {
+                            "cpu": f"{system_metrics.cpu_percent:.1f}%",
+                            "ram": f"{system_metrics.ram_percent:.1f}%",
+                            "gpu": gpu_summary
+                        }
+                    }
                 }
-            }
+            )
 
-            logger.debug(f"Performance metrics: {json.dumps(log_data)}")
+            # 오류 통계 로깅 (있는 경우만)
+            if self.error_counter:
+                top_errors = dict(self.error_counter.most_common(5))
+                logger.warning(
+                    "최근 오류 통계",
+                    context={
+                        "top_errors": top_errors,
+                        "total_errors": self.total_failures
+                    }
+                )
 
-    def _cleanup_completed_requests(self) -> None:
-        """오래된 완료된 요청 정리"""
+    def _cleanup_completed_requests(self) -> int:
+        """
+        오래된 완료된 요청 정리
+
+        Returns:
+            정리된 요청 수
+        """
         with self.lock:
             current_time = time.time()
             to_remove = []
@@ -435,6 +574,8 @@ class MetricsCollector:
             for request_id in to_remove:
                 metrics = self.request_metrics.pop(request_id)
                 self.request_history.append(metrics.to_dict())
+
+            return len(to_remove)  # 정리된 요청 수 반환
 
     def _update_prometheus_system_metrics(self, system_metrics: SystemMetrics) -> None:
         """프로메테우스 시스템 메트릭 업데이트"""
@@ -480,6 +621,17 @@ class MetricsCollector:
             if self.enable_prometheus:
                 self.prometheus_metrics["total_tokens_input"].inc(prompt_tokens)
 
+            # 디버그 로깅
+            logger.debug(
+                "요청 시작됨",
+                context={
+                    "request_id": request_id,
+                    "prompt_tokens": prompt_tokens,
+                    "client_ip": client_ip,
+                    "active_requests": len(self.request_metrics)
+                }
+            )
+
     def start_processing(self, request_id: str, prompt_tokens: Optional[int] = None) -> None:
         """
         요청 처리 시작 (큐에서 꺼내어 실제 처리 시작)
@@ -490,7 +642,14 @@ class MetricsCollector:
         """
         with self.lock:
             if request_id not in self.request_metrics:
-                logger.warning(f"Request {request_id} not found in metrics")
+                logger.warning(
+                    "요청 메트릭을 찾을 수 없음",
+                    context={
+                        "request_id": request_id,
+                        "action": "start_processing",
+                        "available_requests": len(self.request_metrics)
+                    }
+                )
                 return
 
             metrics = self.request_metrics[request_id]
@@ -507,7 +666,18 @@ class MetricsCollector:
                 if self.enable_prometheus and token_diff != 0:
                     self.prometheus_metrics["total_tokens_input"].inc(token_diff)
 
-    def complete_request(self, request_id: str, completion_tokens: int, prompt_tokens: Optional[int] = None) -> None:
+            # 디버그 로깅
+            logger.debug(
+                "요청 처리 시작됨",
+                context={
+                    "request_id": request_id,
+                    "queue_time": f"{metrics.queue_time:.3f}초",
+                    "prompt_tokens": metrics.prompt_tokens
+                }
+            )
+
+    def complete_request(self, request_id: str, completion_tokens: int,
+                         prompt_tokens: Optional[int] = None) -> None:
         """
         요청 처리 완료 기록
 
@@ -518,11 +688,18 @@ class MetricsCollector:
         """
         with self.lock:
             if request_id not in self.request_metrics:
-                logger.warning(f"Request {request_id} not found in metrics")
+                logger.warning(
+                    "요청 메트릭을 찾을 수 없음",
+                    context={
+                        "request_id": request_id,
+                        "action": "complete_request",
+                        "completion_tokens": completion_tokens
+                    }
+                )
                 return
 
             metrics = self.request_metrics[request_id]
-            metrics.complete(completion_tokens, prompt_tokens)
+            completion_info = metrics.complete(completion_tokens, prompt_tokens)
 
             # 통계 업데이트
             self.total_successes += 1
@@ -538,6 +715,22 @@ class MetricsCollector:
                 self.prometheus_metrics["tokens_per_second"].observe(metrics.tokens_per_second)
                 self.prometheus_metrics["active_requests"].dec()
 
+            # 상세 로깅
+            logger.info(
+                "요청 처리 완료",
+                context={
+                    "request_id": request_id,
+                    "metrics": {
+                        "completion_tokens": completion_tokens,
+                        "prompt_tokens": metrics.prompt_tokens,
+                        "total_tokens": metrics.total_tokens,
+                        "total_time": f"{metrics.total_time:.3f}초",
+                        "tokens_per_second": f"{metrics.tokens_per_second:.2f}",
+                        "status": "completed"
+                    }
+                }
+            )
+
     def fail_request(self, request_id: str, error: str) -> None:
         """
         요청 처리 실패 기록
@@ -548,11 +741,18 @@ class MetricsCollector:
         """
         with self.lock:
             if request_id not in self.request_metrics:
-                logger.warning(f"Request {request_id} not found in metrics")
+                logger.warning(
+                    "요청 메트릭을 찾을 수 없음",
+                    context={
+                        "request_id": request_id,
+                        "action": "fail_request",
+                        "error_message": error[:100] + "..." if len(error) > 100 else error
+                    }
+                )
                 return
 
             metrics = self.request_metrics[request_id]
-            metrics.fail(error)
+            fail_info = metrics.fail(error)
 
             # 통계 업데이트
             self.total_failures += 1
@@ -562,6 +762,22 @@ class MetricsCollector:
             if self.enable_prometheus:
                 self.prometheus_metrics["total_failures"].inc()
                 self.prometheus_metrics["active_requests"].dec()
+
+            # 오류 로깅
+            logger.error(
+                "요청 처리 실패",
+                context={
+                    "request_id": request_id,
+                    "metrics": {
+                        "total_time": f"{metrics.total_time:.3f}초",
+                        "status": "failed"
+                    },
+                    "error": {
+                        "message": error,
+                        "count": self.error_counter[error]
+                    }
+                }
+            )
 
     def get_metrics(self) -> Dict[str, Any]:
         """
@@ -576,13 +792,26 @@ class MetricsCollector:
             avg_request_time = statistics.mean(self.request_times) if self.request_times else 0
 
             # 시스템 메트릭 가져오기
-            system_metrics = self.system_metrics_history[-1] if self.system_metrics_history else SystemMetrics.collect()
+            system_metrics = self.system_metrics_history[
+                -1] if self.system_metrics_history else SystemMetrics.collect()
 
             # 활성 요청 정보
             active_requests = {
                 req_id: metrics.to_dict()
                 for req_id, metrics in self.request_metrics.items()
             }
+
+            # 상위 오류 목록 (최대 10개)
+            top_errors = dict(self.error_counter.most_common(10))
+
+            # 로깅
+            logger.debug(
+                "메트릭 요청됨",
+                context={
+                    "active_requests": len(self.request_metrics),
+                    "total_requests": self.total_requests
+                }
+            )
 
             # 결과 구성
             return {
@@ -597,7 +826,7 @@ class MetricsCollector:
                 "total_tokens_output": self.total_tokens_output,
                 "avg_tokens_per_second": avg_tokens_per_second,
                 "avg_request_time": avg_request_time,
-                "error_stats": dict(self.error_counter),
+                "error_stats": top_errors,
                 "system": asdict(system_metrics)
             }
 
@@ -613,13 +842,36 @@ class MetricsCollector:
         """
         with self.lock:
             if request_id in self.request_metrics:
-                return self.request_metrics[request_id].to_dict()
+                metrics = self.request_metrics[request_id].to_dict()
+                logger.debug(
+                    "활성 요청 메트릭 반환",
+                    context={
+                        "request_id": request_id,
+                        "status": metrics["status"]
+                    }
+                )
+                return metrics
 
             # 히스토리에서 찾기
             for metrics in self.request_history:
                 if metrics["request_id"] == request_id:
+                    logger.debug(
+                        "히스토리에서 요청 메트릭 찾음",
+                        context={
+                            "request_id": request_id,
+                            "status": metrics["status"]
+                        }
+                    )
                     return metrics
 
+            logger.warning(
+                "요청 메트릭을 찾을 수 없음",
+                context={
+                    "request_id": request_id,
+                    "active_count": len(self.request_metrics),
+                    "history_count": len(self.request_history)
+                }
+            )
             return None
 
 
@@ -638,48 +890,81 @@ def get_metrics_collector() -> MetricsCollector:
 
     # 모니터링이 비활성화된 경우 가벼운 더미 컬렉터 반환 고려
     if not config.monitoring.enabled:
+        logger.debug("모니터링이 비활성화되어 더미 컬렉터 반환")
         return _create_dummy_collector()
 
     if _metrics_collector is None:
-        _metrics_collector = MetricsCollector(
-            max_history=config.monitoring.log_stats_interval * 10,
-            enable_prometheus=config.monitoring.prometheus,
-            prometheus_port=config.monitoring.metrics_port,
-            log_interval=config.monitoring.log_stats_interval
-        )
-        _metrics_collector.start_collection()
+        with TimingContext(logger, "메트릭 수집기 초기화") as timing:
+            _metrics_collector = MetricsCollector(
+                max_history=config.monitoring.log_stats_interval * 10,
+                enable_prometheus=config.monitoring.prometheus,
+                prometheus_port=config.monitoring.metrics_port,
+                log_interval=config.monitoring.log_stats_interval
+            )
+            _metrics_collector.start_collection()
+
+            logger.info(
+                "메트릭 수집기 초기화 완료",
+                context={
+                    "init_time": f"{timing.duration:.3f}초",
+                    "prometheus_enabled": config.monitoring.prometheus,
+                    "max_history": config.monitoring.log_stats_interval * 10
+                }
+            )
 
     return _metrics_collector
 
+    # 더미 컬렉터 생성 함수 추가
 
-# 더미 컬렉터 생성 함수 추가
+
 def _create_dummy_collector():
     """모니터링 비활성화 상태에서 사용할 더미 컬렉터 생성"""
-    global _dummy_collector
-
     if not hasattr(get_metrics_collector, '_dummy_collector'):
         class DummyCollector:
-            def start_request(self, *args, **kwargs): pass
+            """모니터링이 비활성화된 경우 사용되는 더미 컬렉터 클래스"""
 
-            def start_processing(self, *args, **kwargs): pass
+            def __init__(self):
+                logger.debug("더미 메트릭 컬렉터 생성됨")
 
-            def complete_request(self, *args, **kwargs): pass
+            def start_request(self, *args, **kwargs):
+                logger.debug("더미 컬렉터: start_request 호출됨 (무시됨)")
+                pass
 
-            def fail_request(self, *args, **kwargs): pass
+            def start_processing(self, *args, **kwargs):
+                logger.debug("더미 컬렉터: start_processing 호출됨 (무시됨)")
+                pass
 
-            def get_metrics(self): return {"status": "monitoring_disabled"}
+            def complete_request(self, *args, **kwargs):
+                logger.debug("더미 컬렉터: complete_request 호출됨 (무시됨)")
+                pass
 
-            def get_request_metrics(self, *args): return None
+            def fail_request(self, *args, **kwargs):
+                logger.debug("더미 컬렉터: fail_request 호출됨 (무시됨)")
+                pass
 
-            def start_collection(self): pass
+            def get_metrics(self):
+                logger.debug("더미 컬렉터: get_metrics 호출됨")
+                return {"status": "monitoring_disabled"}
 
-            def stop_collection(self): pass
+            def get_request_metrics(self, *args):
+                logger.debug("더미 컬렉터: get_request_metrics 호출됨")
+                return None
+
+            def start_collection(self):
+                logger.debug("더미 컬렉터: start_collection 호출됨 (무시됨)")
+                pass
+
+            def stop_collection(self):
+                logger.debug("더미 컬렉터: stop_collection 호출됨 (무시됨)")
+                pass
 
         get_metrics_collector._dummy_collector = DummyCollector()
+        logger.info("더미 메트릭 컬렉터가 생성되었습니다 (모니터링 비활성화됨)")
 
     return get_metrics_collector._dummy_collector
 
 
+@with_logging_context
 def track_request(func):
     """
     요청 메트릭 추적 데코레이터
@@ -697,53 +982,131 @@ def track_request(func):
     async def wrapper(*args, **kwargs):
         # 모니터링이 비활성화된 경우 원본 함수만 실행
         if not config.monitoring.enabled:
+            logger.debug("모니터링이 비활성화되어 메트릭 추적 없이 함수 실행")
             return await func(*args, **kwargs)
 
-        # 요청 ID 생성
-        request_id = str(uuid.uuid4())
+        # 요청 ID 추출 또는 생성
+        request_id = None
+        # 요청 객체에서 request_id 추출 시도
+        for arg in args:
+            if hasattr(arg, 'request_id') and arg.request_id:
+                request_id = arg.request_id
+                break
+
+        # 키워드 인자에서 request_id 추출 시도
+        if request_id is None and 'request_id' in kwargs:
+            request_id = kwargs['request_id']
+
+        # 생성되지 않은 경우 새로 생성
+        if request_id is None:
+            request_id = str(uuid.uuid4())
 
         # 요청 데이터 추출
         request_data = None
         client_ip = None
+        prompt_tokens = 0
+
         for arg in args:
             if hasattr(arg, 'client') and hasattr(arg.client, 'host'):
                 client_ip = arg.client.host
             if hasattr(arg, 'prompt'):
                 request_data = arg
+                # 프롬프트 토큰 수 추출 시도
+                if hasattr(arg, 'prompt_tokens'):
+                    prompt_tokens = arg.prompt_tokens
 
         # 클라이언트 IP 추출 (키워드 인자에서)
         if client_ip is None and 'client_request' in kwargs:
-            client_ip = kwargs['client_request'].client.host if hasattr(kwargs['client_request'], 'client') else None
+            client_ip = kwargs['client_request'].client.host if hasattr(kwargs['client_request'],
+                                                                        'client') else None
+
+        # 컨텍스트에 요청 ID 추가하여 로깅
+        logger.with_context(request_id=request_id)
+
+        logger.info(
+            "API 요청 처리 시작",
+            context={
+                "request_id": request_id,
+                "client_ip": client_ip,
+                "function": func.__name__
+            }
+        )
 
         # 요청 시작 기록
         collector = get_metrics_collector()
-        collector.start_request(request_id, client_ip=client_ip)
+        collector.start_request(request_id, prompt_tokens=prompt_tokens, client_ip=client_ip)
+
+        # 타이밍 측정
+        start_time = time.time()
 
         try:
             # 요청 처리 시작
             collector.start_processing(request_id)
 
             # 원본 함수 호출
-            result = await func(*args, **kwargs)
+            with TimingContext(logger, f"API 함수 {func.__name__}") as timing:
+                result = await func(*args, **kwargs)
+
+            # 실행 시간 계산
+            execution_time = timing.duration
 
             # 요청 완료 시 메트릭 업데이트
             if isinstance(result, dict) and "usage" in result:
                 usage = result["usage"]
+                completion_tokens = usage.get("completion_tokens", 0)
+                prompt_tokens = usage.get("prompt_tokens", 0)
+
                 collector.complete_request(
                     request_id,
-                    completion_tokens=usage.get("completion_tokens", 0),
-                    prompt_tokens=usage.get("prompt_tokens", 0)
+                    completion_tokens=completion_tokens,
+                    prompt_tokens=prompt_tokens
+                )
+
+                logger.info(
+                    "API 요청 처리 완료",
+                    context={
+                        "request_id": request_id,
+                        "execution_time": f"{execution_time:.3f}초",
+                        "tokens": {
+                            "prompt": prompt_tokens,
+                            "completion": completion_tokens,
+                            "total": prompt_tokens + completion_tokens
+                        }
+                    }
                 )
             else:
                 # 사용량 정보가 없는 경우
                 collector.complete_request(request_id, completion_tokens=0)
 
+                logger.info(
+                    "API 요청 처리 완료 (토큰 정보 없음)",
+                    context={
+                        "request_id": request_id,
+                        "execution_time": f"{execution_time:.3f}초"
+                    }
+                )
+
             return result
 
         except Exception as e:
             # 오류 발생 시 실패 기록
+            execution_time = time.time() - start_time
             collector.fail_request(request_id, str(e))
+
+            logger.error(
+                "API 요청 처리 실패",
+                context={
+                    "request_id": request_id,
+                    "execution_time": f"{execution_time:.3f}초",
+                    "error_type": type(e).__name__,
+                    "error": str(e)
+                },
+                exc_info=True
+            )
             raise
+        finally:
+            # 컨텍스트 정리
+            logger.clear_context()
 
     return wrapper
 
@@ -751,28 +1114,114 @@ def track_request(func):
 async def monitor_gpu_memory():
     """GPU 메모리 사용량 모니터링"""
     if not torch.cuda.is_available():
-        logger.warning("CUDA is not available. GPU monitoring disabled.")
+        logger.warning(
+            "CUDA를 사용할 수 없습니다. GPU 모니터링이 비활성화됩니다.",
+            context={"feature": "gpu_monitoring"}
+        )
         return
 
     try:
         # GPU 개수 확인
         num_gpus = torch.cuda.device_count()
-        logger.info(f"Monitoring {num_gpus} GPUs")
+        logger.info(
+            "GPU 모니터링 시작",
+            context={
+                "gpu_count": num_gpus,
+                "interval": "10초"
+            }
+        )
+
+        last_alert_time = 0  # 마지막 경고 시간
+        alert_threshold = 0.9  # 경고 임계값 (90%)
 
         while True:
-            for i in range(num_gpus):
-                # 메모리 사용량 (GB)
-                allocated = torch.cuda.memory_allocated(i) / 1e9
-                reserved = torch.cuda.memory_reserved(i) / 1e9
+            gpu_stats = []
+            high_usage_detected = False
 
-                # 로깅
-                logger.debug(f"GPU {i}: Allocated: {allocated:.2f} GB, Reserved: {reserved:.2f} GB")
+            for i in range(num_gpus):
+                try:
+                    # 메모리 사용량 (GB)
+                    allocated = torch.cuda.memory_allocated(i) / 1e9
+                    reserved = torch.cuda.memory_reserved(i) / 1e9
+
+                    # GPU 정보 가져오기
+                    gpu_name = torch.cuda.get_device_name(i)
+
+                    # 사용률 계산 (예상치)
+                    if HAS_GPUTIL:
+                        try:
+                            gpus = GPUtil.getGPUs()
+                            if i < len(gpus):
+                                usage_percent = gpus[i].memoryUtil * 100
+                                temp = gpus[i].temperature
+                            else:
+                                usage_percent = (allocated / reserved) * 100 if reserved > 0 else 0
+                                temp = None
+                        except Exception:
+                            usage_percent = (allocated / reserved) * 100 if reserved > 0 else 0
+                            temp = None
+                    else:
+                        usage_percent = (allocated / reserved) * 100 if reserved > 0 else 0
+                        temp = None
+
+                    gpu_info = {
+                        "id": i,
+                        "name": gpu_name,
+                        "allocated_gb": f"{allocated:.2f}",
+                        "reserved_gb": f"{reserved:.2f}",
+                        "usage_percent": f"{usage_percent:.1f}%"
+                    }
+
+                    if temp is not None:
+                        gpu_info["temperature"] = f"{temp}°C"
+
+                    gpu_stats.append(gpu_info)
+
+                    # 높은 사용률 감지
+                    if usage_percent > alert_threshold * 100:
+                        high_usage_detected = True
+
+                except Exception as gpu_err:
+                    logger.warning(
+                        f"GPU {i} 모니터링 중 오류 발생",
+                        context={
+                            "gpu_id": i,
+                            "error": str(gpu_err)
+                        }
+                    )
+
+            # 로깅 (매 반복마다 디버그 레벨)
+            logger.debug(
+                "GPU 메모리 상태",
+                context={
+                    "gpus": gpu_stats
+                }
+            )
+
+            # 높은 사용률 감지 시 경고 (최소 5분에 한 번)
+            current_time = time.time()
+            if high_usage_detected and (current_time - last_alert_time) > 300:
+                logger.warning(
+                    "높은 GPU 메모리 사용률 감지됨",
+                    context={
+                        "gpus": gpu_stats,
+                        "threshold": f"{alert_threshold * 100}%"
+                    }
+                )
+                last_alert_time = current_time
 
             # 주기적 체크 (10초마다)
             await asyncio.sleep(10)
 
     except Exception as e:
-        logger.error(f"Error in GPU monitoring: {str(e)}", exc_info=True)
+        logger.error(
+            "GPU 모니터링 중 오류 발생",
+            context={
+                "error_type": type(e).__name__,
+                "error": str(e)
+            },
+            exc_info=True
+        )
 
 
 # 모듈 초기화
@@ -786,18 +1235,33 @@ def init_monitoring():
         try:
             # 메트릭 수집기 초기화
             collector = get_metrics_collector()
-            logger.info("Metrics collector initialized")
+            logger.info(
+                "모니터링 시스템 초기화됨",
+                context={
+                    "prometheus_enabled": config.monitoring.prometheus,
+                    "metrics_port": config.monitoring.metrics_port,
+                    "log_interval": config.monitoring.log_stats_interval,
+                    "record_memory": config.monitoring.record_memory
+                }
+            )
 
             # GPU 메모리 모니터링 시작 (비동기 함수이므로 직접 호출하지 않음)
             if config.monitoring.record_memory and torch.cuda.is_available():
-                logger.info("GPU memory monitoring enabled")
+                logger.info("GPU 메모리 모니터링이 활성화되었습니다")
 
             return collector
         except Exception as e:
-            logger.error(f"Failed to initialize monitoring: {str(e)}", exc_info=True)
+            logger.error(
+                "모니터링 초기화 실패",
+                context={
+                    "error_type": type(e).__name__,
+                    "error": str(e)
+                },
+                exc_info=True
+            )
             return None
     else:
-        logger.info("Monitoring is disabled in configuration")
+        logger.info("설정에 따라 모니터링이 비활성화되었습니다")
         return None
 
 
@@ -809,8 +1273,25 @@ async def get_current_metrics():
     Returns:
         현재 메트릭 정보 딕셔너리
     """
-    collector = get_metrics_collector()
-    return collector.get_metrics()
+    try:
+        collector = get_metrics_collector()
+        metrics = collector.get_metrics()
+        logger.debug("현재 메트릭 정보가 요청되었습니다")
+        return metrics
+    except Exception as e:
+        logger.error(
+            "메트릭 정보 조회 중 오류 발생",
+            context={
+                "error_type": type(e).__name__,
+                "error": str(e)
+            },
+            exc_info=True
+        )
+        return {
+            "status": "error",
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }
 
 
 async def get_request_metrics_by_id(request_id: str):
@@ -823,5 +1304,38 @@ async def get_request_metrics_by_id(request_id: str):
     Returns:
         요청 메트릭 정보 딕셔너리, 없으면 None
     """
-    collector = get_metrics_collector()
-    return collector.get_request_metrics(request_id)
+    try:
+        collector = get_metrics_collector()
+        metrics = collector.get_request_metrics(request_id)
+        if metrics is None:
+            logger.warning(
+                "요청된 메트릭을 찾을 수 없음",
+                context={
+                    "request_id": request_id
+                }
+            )
+        else:
+            logger.debug(
+                "요청 메트릭 정보가 조회됨",
+                context={
+                    "request_id": request_id,
+                    "status": metrics.get("status", "unknown")
+                }
+            )
+        return metrics
+    except Exception as e:
+        logger.error(
+            "요청 메트릭 정보 조회 중 오류 발생",
+            context={
+                "request_id": request_id,
+                "error_type": type(e).__name__,
+                "error": str(e)
+            },
+            exc_info=True
+        )
+        return {
+            "status": "error",
+            "error": str(e),
+            "request_id": request_id,
+            "timestamp": datetime.now().isoformat()
+        }
