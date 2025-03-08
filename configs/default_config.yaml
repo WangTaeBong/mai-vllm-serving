@@ -4,7 +4,7 @@
 server:
   host: "0.0.0.0"            # 서버 호스트 주소
   port: 8020                 # 서버 포트
-  workers: 2                 # L40s 2개에 적합
+  workers: 1                 # L40s 2개에 적합
   log_level: "info"          # 로깅 레벨 (debug, info, warning, error, critical)
   request_timeout: 600       # 요청 타임아웃 (초)
   cors_origins: ["*"]        # CORS 허용 도메인
@@ -28,7 +28,7 @@ engine:
   max_num_batched_tokens: 12288  # 큰 컨텍스트 윈도우 활용 (128K)
   block_size: 16             # KV 캐시 블록 크기 증가 (긴 컨텍스트용)
   swap_space: 32             # CPU 스왑 공간 크기 (GB)
-  enforce_eager: true       # PyTorch eager 모드 강제 실행 여부
+  enforce_eager: false       # PyTorch eager 모드 강제 실행 여부
   disable_log_stats: false   # 통계 로깅 비활성화 여부
   dtype: "bfloat16"          # config.json과 일치하는 데이터 타입
   sliding_window: null       # config.json과 일치시킴
@@ -59,12 +59,12 @@ tokenizer:
 # 추론 기본 설정
 inference:
   max_tokens: 4096           # 생성할 최대 토큰 수
-  temperature: 0.0           # 샘플링 온도 (0.0 ~ 2.0)
-  top_p: 1.0                # 누적 확률 임계값 (0.0 ~ 1.0)
-  top_k: 1                  # 샘플링할 최상위 토큰 수
+  temperature: 0.1           # 샘플링 온도 (0.0 ~ 2.0)
+  top_p: 0.9                 # 누적 확률 임계값 (0.0 ~ 1.0)
+  top_k: 50                  # 샘플링할 최상위 토큰 수
   frequency_penalty: 0.0     # 빈도 페널티 (0.0 ~ 2.0)
-  presence_penalty: 0.0      # 존재 페널티 (0.0 ~ 2.0)
-  repetition_penalty: 1.0   # 반복 페널티 (1.0 ~ 2.0)
+  presence_penalty: 0.2      # 존재 페널티 (0.0 ~ 2.0)
+  repetition_penalty: 1.1    # 반복 페널티 (1.0 ~ 2.0)
   no_repeat_ngram_size: 0    # 반복하지 않을 n-gram 크기
   seed: 42                   # 랜덤 시드 (null: 랜덤)
 
