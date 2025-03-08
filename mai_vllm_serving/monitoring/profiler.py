@@ -8,6 +8,7 @@ import functools
 import gc
 import json
 import logging
+import memory_profiler
 import os
 import threading
 import time
@@ -16,6 +17,7 @@ from datetime import datetime
 from typing import Dict, List, Optional, Any, Callable, cast
 
 import psutil
+import py3nvml
 import py3nvml.py3nvml as nvml
 import torch
 import torch.profiler as torch_profiler
@@ -39,7 +41,12 @@ OPTIONAL_PACKAGES = {
 }
 
 # 의존성 가져오기 및 상태 추적
-PACKAGE_STATUS = {}
+PACKAGE_STATUS = {
+    "torch_profiler": True,
+    "gputil": True,
+    "memory_profiler": True,
+    "nvml": True
+}
 
 # 로깅 설정
 config = get_config()
