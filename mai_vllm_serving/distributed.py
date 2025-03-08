@@ -188,15 +188,36 @@ class DistributedVLLMEngine:
         if dist.is_initialized():
             logger.info("분산 환경 종료 중...")
             try:
-                # 모든 분산 작업이 완료될 때까지 대기
-                dist.barrier()
+                # 타임아웃이 있는 barrier 사용
+                timeout = datetime.timedelta(seconds=30)
+                try:
+                    dist.barrier(timeout=timeout)
+                    logger.info("모든 프로세스가 barrier에 도달했습니다.")
+                except Exception as e:
+                    logger.warning(f"barrier 도달 중 오류 발생: {str(e)}. 계속 진행합니다.")
 
-                # 프로세스 그룹 정리 추가 - 이 부분이 없거나 적절히 호출되지 않았을 수 있음
+                # CUDA 캐시 정리
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    logger.info("CUDA 캐시를 정리했습니다.")
+
+                # 프로세스 그룹 정리
                 dist.destroy_process_group()
+                logger.info("분산 프로세스 그룹이 정상적으로 종료되었습니다.")
 
-                logger.info("분산 환경이 정상적으로 종료되었습니다")
             except Exception as e:
                 logger.error(f"분산 환경 종료 중 오류 발생: {str(e)}", exc_info=True)
+                # 중요: 오류가 발생해도 기본 정리는 시도
+                try:
+                    dist.destroy_process_group()
+                except:
+                    pass
+            finally:
+                # 환경 변수 정리 (선택적)
+                for var in ["MASTER_ADDR", "MASTER_PORT", "RANK", "WORLD_SIZE", "LOCAL_RANK"]:
+                    if var in os.environ:
+                        del os.environ[var]
+                logger.info("분산 환경 변수가 정리되었습니다.")
 
     def _validate_and_set_defaults(self,
                                    tensor_parallel_size, pipeline_parallel_size,

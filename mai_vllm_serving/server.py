@@ -8,7 +8,9 @@ import locale
 import os
 import sys
 import time
+import torch
 import uuid
+import warnings
 from contextlib import asynccontextmanager
 from typing import List, Optional, Union
 
@@ -38,6 +40,13 @@ from mai_vllm_serving.utils.logging_utils import (
     get_request_logger,
     TimingContext
 )
+
+# 공유 메모리 누수 경고 무시
+warnings.filterwarnings("ignore",
+                        message="UserWarning: resource_tracker: "
+                                "There appear to be 1 leaked shared_memory objects to clean up at shutdown")
+# NCCL 프로세스 그룹 경고 필터링
+warnings.filterwarnings("ignore", message=".*process group has NOT been destroyed.*")
 
 # 설정 객체 가져오기
 config = get_config()
@@ -221,12 +230,28 @@ async def lifespan(app_: FastAPI):
                 metrics_collector = get_metrics_collector()
                 metrics_collector.stop_collection()
                 logger.info("Metrics collection stopped")
+
+                # 프로파일러 정리 추가
+                try:
+                    profiler = get_profiler()
+                    profiler.stop()
+                    logger.info("Profiler stopped")
+                except Exception as e:
+                    logger.warning(f"Failed to stop profiler: {str(e)}")
             except Exception as e:
                 logger.warning(f"Failed to stop metrics collection: {str(e)}")
 
         # 분산 처리 종료
         if isinstance(engine, DistributedVLLMEngine):
             engine.shutdown()
+
+        # CUDA 캐시 정리 (분산 여부와 상관없이)
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+                logger.info("CUDA cache cleared")
+            except Exception as e:
+                logger.warning(f"Failed to clear CUDA cache: {str(e)}")
 
         logger.info("mai-vllm-serving shutdown completed")
 
