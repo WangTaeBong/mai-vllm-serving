@@ -264,8 +264,8 @@ class MAIVLLMEngine:
             metrics_collector.start_request(req_config.request_id)
 
         # 추론 시작 로깅
-        logger.info(f"Request {req_config.request_id} received: prompt length={len(req_config.prompt)}, "
-                    f"max_tokens={req_config.max_tokens}, temperature={req_config.temperature}")
+        logger.debug(f"Request {req_config.request_id} received: prompt length={len(req_config.prompt)}, "
+                     f"max_tokens={req_config.max_tokens}, temperature={req_config.temperature}")
 
         # 타이밍 컨텍스트 시작
         with TimingContext(logger, f"Request {req_config.request_id} processing") as timing:

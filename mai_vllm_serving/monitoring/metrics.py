@@ -416,7 +416,7 @@ class MetricsCollector:
                 }
             }
 
-            logger.info(f"Performance metrics: {json.dumps(log_data)}")
+            logger.debug(f"Performance metrics: {json.dumps(log_data)}")
 
     def _cleanup_completed_requests(self) -> None:
         """오래된 완료된 요청 정리"""

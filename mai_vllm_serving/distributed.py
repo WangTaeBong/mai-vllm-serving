@@ -389,16 +389,16 @@ class DistributedVLLMEngine:
     def _log_initialization_params(self):
         """초기화 매개변수 로깅"""
         logger.info(f"Initializing distributed vLLM engine with {self.model_name}")
-        logger.info(f"Tensor parallel size: {self.tensor_parallel_size}")
-        logger.info(f"Pipeline parallel size: {self.pipeline_parallel_size}")
-        logger.info(f"GPU memory utilization: {self.gpu_memory_utilization}")
-        logger.info(f"Max model length: {self.max_model_len}")
-        logger.info(f"Max num sequences: {self.max_num_seqs}")
-        logger.info(f"Max num batched tokens: {self.max_num_batched_tokens}")
-        logger.info(f"Quantization: {self.quantization}")
-        logger.info(f"Swap space: {self.swap_space} GB")
-        logger.info(f"Dtype: {self.dtype}")
-        logger.info(f"Enforce eager: {self.enforce_eager}")
+        logger.debug(f"Tensor parallel size: {self.tensor_parallel_size}")
+        logger.debug(f"Pipeline parallel size: {self.pipeline_parallel_size}")
+        logger.debug(f"GPU memory utilization: {self.gpu_memory_utilization}")
+        logger.debug(f"Max model length: {self.max_model_len}")
+        logger.debug(f"Max num sequences: {self.max_num_seqs}")
+        logger.debug(f"Max num batched tokens: {self.max_num_batched_tokens}")
+        logger.debug(f"Quantization: {self.quantization}")
+        logger.debug(f"Swap space: {self.swap_space} GB")
+        logger.debug(f"Dtype: {self.dtype}")
+        logger.debug(f"Enforce eager: {self.enforce_eager}")
 
     def _init_distributed(self):
         """분산 환경 초기화"""

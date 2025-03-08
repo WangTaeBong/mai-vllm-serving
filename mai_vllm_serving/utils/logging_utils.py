@@ -1,8 +1,9 @@
 """
-mai-vllm-serving 로깅 유틸리티
-로깅 설정 및 관리를 위한 유틸리티 함수
+mai-vllm-serving 향상된 구조화 로깅 유틸리티
+모든 모듈에서 일관된 JSON 구조화 로깅을 위한 기능 제공
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -12,15 +13,12 @@ import time
 import traceback
 import uuid
 from datetime import datetime
+from functools import wraps
 from logging.handlers import TimedRotatingFileHandler
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Callable
 
 # 설정 모듈 임포트
 from mai_vllm_serving.utils.config import get_config
-
-
-# locale 설정 제거하고 UTF-8 인코딩 사용
-# locale.setlocale(locale.LC_ALL, 'ko_KR.UTF-8') 라인 제거
 
 
 # 로그 디렉토리 생성 함수
@@ -86,17 +84,19 @@ class UTF8TimedRotatingFileHandler(TimedRotatingFileHandler):
 
 # JSON 로깅을 위한 사용자 정의 Formatter
 class JsonFormatter(logging.Formatter):
-    """JSON 형식의 로그 포맷터"""
+    """향상된 JSON 형식의 로그 포맷터"""
 
-    def __init__(self, service_name: str = "mai-vllm-serving"):
+    def __init__(self, service_name: str = "mai-vllm-serving", include_caller_info: bool = True):
         """
         JSON 로그 포맷터 초기화
 
         Args:
             service_name: 서비스 이름 (로그에 포함됨)
+            include_caller_info: 호출자 정보(파일명, 라인번호) 포함 여부
         """
         super().__init__()
         self.service_name = service_name
+        self.include_caller_info = include_caller_info
 
     def format(self, record: logging.LogRecord) -> str:
         """
@@ -119,6 +119,14 @@ class JsonFormatter(logging.Formatter):
             "process": record.process
         }
 
+        # 호출자 정보 추가 (선택적)
+        if self.include_caller_info:
+            log_data["location"] = {
+                "file": record.pathname,
+                "line": record.lineno,
+                "function": record.funcName
+            }
+
         # 예외 정보가 있는 경우 추가
         if record.exc_info:
             log_data["exception"] = {
@@ -129,7 +137,12 @@ class JsonFormatter(logging.Formatter):
 
         # 추가 속성이 있는 경우 추가
         if hasattr(record, "extra") and record.extra:
-            log_data.update(record.extra)
+            # 충돌 방지를 위해 'extra' 키로 묶음
+            log_data["extra"] = record.extra
+
+        # 상세한 로깅 컨텍스트가 있는 경우
+        if hasattr(record, "context") and record.context:
+            log_data["context"] = record.context
 
         return json.dumps(log_data, ensure_ascii=False)
 
@@ -367,14 +380,347 @@ class TimingContext:
         return end - self.start_time
 
 
+# 구조화된 로깅을 위한 래퍼 클래스
+class StructuredLogger:
+    """구조화된 로깅을 위한 래퍼 클래스"""
+
+    def __init__(self, logger: logging.Logger):
+        """
+        구조화된 로거 초기화
+
+        Args:
+            logger: 기본 로거 인스턴스
+        """
+        self.logger = logger
+        self.thread_local = threading.local()
+
+        # 기본 컨텍스트 정보
+        self.thread_local.context = {}
+
+        # 요청 ID 추적 (각 스레드마다 별도 저장)
+        self.thread_local.request_id = None
+
+    def with_context(self, **kwargs) -> 'StructuredLogger':
+        """
+        로깅 컨텍스트 설정
+
+        Args:
+            **kwargs: 컨텍스트에 추가할 키-값 쌍
+
+        Returns:
+            현재 구조화된 로거 인스턴스
+        """
+        if not hasattr(self.thread_local, 'context'):
+            self.thread_local.context = {}
+
+        self.thread_local.context.update(kwargs)
+        return self
+
+    def clear_context(self) -> None:
+        """로깅 컨텍스트 초기화"""
+        self.thread_local.context = {}
+
+    def set_request_id(self, request_id: str) -> None:
+        """
+        현재 스레드의 요청 ID 설정
+
+        Args:
+            request_id: 요청 ID
+        """
+        self.thread_local.request_id = request_id
+
+    def get_request_id(self) -> Optional[str]:
+        """
+        현재 스레드의 요청 ID 반환
+
+        Returns:
+            요청 ID 또는 None
+        """
+        return getattr(self.thread_local, 'request_id', None)
+
+    def _log(self, level: int, msg: str, *args, **kwargs) -> None:
+        """
+        내부 로깅 메서드
+
+        Args:
+            level: 로그 레벨
+            msg: 로그 메시지
+            *args: 포맷 인자
+            **kwargs: 추가 인자
+        """
+        # extra 인자 처리
+        extra = kwargs.pop('extra', {})
+
+        # 컨텍스트 정보와 요청 ID 추가
+        context = getattr(self.thread_local, 'context', {}).copy()
+
+        request_id = getattr(self.thread_local, 'request_id', None)
+        if request_id:
+            context['request_id'] = request_id
+
+        # kwargs에서 context 키워드가 있으면 기존 컨텍스트와 병합
+        if 'context' in kwargs:
+            context.update(kwargs.pop('context'))
+
+        # extra에 컨텍스트 정보 추가
+        extra['context'] = context
+
+        # 원래 로거에 전달
+        self.logger.log(level, msg, *args, extra=extra, **kwargs)
+
+    def debug(self, msg: str, *args, **kwargs) -> None:
+        """DEBUG 레벨 로깅"""
+        self._log(logging.DEBUG, msg, *args, **kwargs)
+
+    def info(self, msg: str, *args, **kwargs) -> None:
+        """INFO 레벨 로깅"""
+        self._log(logging.INFO, msg, *args, **kwargs)
+
+    def warning(self, msg: str, *args, **kwargs) -> None:
+        """WARNING 레벨 로깅"""
+        self._log(logging.WARNING, msg, *args, **kwargs)
+
+    def error(self, msg: str, *args, **kwargs) -> None:
+        """ERROR 레벨 로깅"""
+        self._log(logging.ERROR, msg, *args, **kwargs)
+
+    def critical(self, msg: str, *args, **kwargs) -> None:
+        """CRITICAL 레벨 로깅"""
+        self._log(logging.CRITICAL, msg, *args, **kwargs)
+
+    def exception(self, msg: str, *args, **kwargs) -> None:
+        """예외 로깅 (ERROR 레벨, 스택 트레이스 포함)"""
+        kwargs['exc_info'] = kwargs.get('exc_info', True)
+        self._log(logging.ERROR, msg, *args, **kwargs)
+
+    def log_api_request(self, method: str, endpoint: str, params: Optional[Dict] = None) -> None:
+        """
+        API 요청 로깅
+
+        Args:
+            method: HTTP 메서드
+            endpoint: API 엔드포인트
+            params: 요청 파라미터 (선택적)
+        """
+        self.info(f"API Request: {method} {endpoint}",
+                  context={
+                      'api': {
+                          'method': method,
+                          'endpoint': endpoint,
+                          'params': params or {}
+                      }
+                  })
+
+    def log_api_response(self, status_code: int, response_time: float, data: Optional[Any] = None) -> None:
+        """
+        API 응답 로깅
+
+        Args:
+            status_code: HTTP 상태 코드
+            response_time: 응답 시간 (초)
+            data: 응답 데이터 (선택적)
+        """
+        self.info(f"API Response: {status_code} in {response_time:.3f}s",
+                  context={
+                      'api': {
+                          'status_code': status_code,
+                          'response_time': response_time,
+                          'data': data or {}
+                      }
+                  })
+
+    def log_model_inference(self, model_name: str, tokens_in: int, tokens_out: int,
+                            inference_time: float, tokens_per_second: float) -> None:
+        """
+        모델 추론 로깅
+
+        Args:
+            model_name: 모델 이름
+            tokens_in: 입력 토큰 수
+            tokens_out: 출력 토큰 수
+            inference_time: 추론 시간 (초)
+            tokens_per_second: 초당 생성 토큰 수
+        """
+        self.info(f"Model inference: {tokens_out} tokens in {inference_time:.3f}s ({tokens_per_second:.2f} tokens/sec)",
+                  context={
+                      'model': {
+                          'name': model_name,
+                          'tokens_in': tokens_in,
+                          'tokens_out': tokens_out,
+                          'inference_time': inference_time,
+                          'tokens_per_second': tokens_per_second
+                      }
+                  })
+
+
+def with_logging_context(func: Optional[Callable] = None, **context_kwargs):
+    """
+    로깅 컨텍스트를 설정하는 데코레이터
+
+    Args:
+        func: 데코레이트할 함수
+        **context_kwargs: 로깅 컨텍스트에 설정할 키-값 쌍
+
+    Returns:
+        데코레이트된 함수
+    """
+
+    def decorator(f):
+        @wraps(f)
+        def wrapper(*args, **kwargs):
+            # 로거 이름은 함수가 속한 모듈에서 가져옴
+            logger_name = f.__module__
+            logger = get_logger(logger_name)
+
+            # 함수 시작 시 컨텍스트 설정
+            logger.with_context(function=f.__name__, **context_kwargs)
+
+            # 함수 실행 시간 측정 시작
+            start_time = time.time()
+
+            try:
+                # 실제 함수 실행
+                result = f(*args, **kwargs)
+                return result
+            except Exception as e:
+                # 예외 발생 시 로깅
+                logger.exception(f"Exception in {f.__name__}: {str(e)}")
+                raise
+            finally:
+                # 실행 시간 로깅
+                execution_time = time.time() - start_time
+                logger.debug(f"Function {f.__name__} executed in {execution_time:.3f}s")
+
+                # 컨텍스트 정리
+                logger.clear_context()
+
+        return wrapper
+
+    # 데코레이터가 인자 없이 직접 사용된 경우
+    if func is not None:
+        return decorator(func)
+
+    # 데코레이터가 인자와 함께 사용된 경우
+    return decorator
+
+
+def with_request_context(func: Optional[Callable] = None, request_id_arg: str = 'request_id'):
+    """
+    요청 ID를 로깅 컨텍스트에 설정하는 데코레이터
+
+    Args:
+        func: 데코레이트할 함수
+        request_id_arg: 요청 ID를 포함하는 인자 이름
+
+    Returns:
+        데코레이트된 함수
+    """
+
+    def decorator(f):
+        @wraps(f)
+        async def async_wrapper(*args, **kwargs):
+            # 로거 이름은 함수가 속한 모듈에서 가져옴
+            logger_name = f.__module__
+            logger = get_logger(logger_name)
+
+            # 요청 ID 설정
+            request_id = kwargs.get(request_id_arg)
+            if request_id is None and len(args) > 0:
+                # 첫 번째 인자가 RequestConfig인 경우
+                first_arg = args[0]
+                if hasattr(first_arg, 'request_id'):
+                    request_id = first_arg.request_id
+
+            # 요청 ID가 없으면 생성
+            if request_id is None:
+                request_id = str(uuid.uuid4())
+
+            logger.set_request_id(request_id)
+            logger.info(f"Request {request_id} started")
+
+            # 시작 시간 기록
+            start_time = time.time()
+
+            try:
+                # 비동기 함수 실행
+                result = await f(*args, **kwargs)
+                return result
+            except Exception as e:
+                # 예외 발생 시 로깅
+                logger.exception(f"Request {request_id} failed: {str(e)}")
+                raise
+            finally:
+                # 실행 시간 로깅
+                execution_time = time.time() - start_time
+                logger.info(f"Request {request_id} completed in {execution_time:.3f}s")
+
+                # 요청 ID 정리
+                logger.set_request_id(None)
+
+        @wraps(f)
+        def sync_wrapper(*args, **kwargs):
+            # 로거 이름은 함수가 속한 모듈에서 가져옴
+            logger_name = f.__module__
+            logger = get_logger(logger_name)
+
+            # 요청 ID 설정
+            request_id = kwargs.get(request_id_arg)
+            if request_id is None and len(args) > 0:
+                # 첫 번째 인자가 RequestConfig인 경우
+                first_arg = args[0]
+                if hasattr(first_arg, 'request_id'):
+                    request_id = first_arg.request_id
+
+            # 요청 ID가 없으면 생성
+            if request_id is None:
+                request_id = str(uuid.uuid4())
+
+            logger.set_request_id(request_id)
+            logger.info(f"Request {request_id} started")
+
+            # 시작 시간 기록
+            start_time = time.time()
+
+            try:
+                # 함수 실행
+                result = f(*args, **kwargs)
+                return result
+            except Exception as e:
+                # 예외 발생 시 로깅
+                logger.exception(f"Request {request_id} failed: {str(e)}")
+                raise
+            finally:
+                # 실행 시간 로깅
+                execution_time = time.time() - start_time
+                logger.info(f"Request {request_id} completed in {execution_time:.3f}s")
+
+                # 요청 ID 정리
+                logger.set_request_id(None)
+
+        # 비동기 함수인 경우 async_wrapper 반환, 그렇지 않으면 sync_wrapper 반환
+        if asyncio.iscoroutinefunction(f):
+            return async_wrapper
+        else:
+            return sync_wrapper
+
+    # 데코레이터가 인자 없이 직접 사용된 경우
+    if func is not None:
+        return decorator(func)
+
+    # 데코레이터가 인자와 함께 사용된 경우
+    return decorator
+
+
+# 로깅 초기화 함수
 # 로깅 초기화 함수
 def setup_logging(service_name: str = "mai-vllm-serving",
                   log_level: Optional[str] = None,
                   log_format: Optional[str] = None,
                   log_file: Optional[str] = None,
-                  use_json: Optional[bool] = None) -> logging.Logger:
+                  use_json: Optional[bool] = None,
+                  include_caller_info: bool = True) -> logging.Logger:
     """
-    로깅 시스템 초기화
+    향상된 로깅 시스템 초기화
 
     Args:
         service_name: 서비스 이름
@@ -382,6 +728,7 @@ def setup_logging(service_name: str = "mai-vllm-serving",
         log_format: 로그 포맷 문자열
         log_file: 로그 파일 경로
         use_json: JSON 형식 로깅 사용 여부
+        include_caller_info: 호출자 정보(파일명, 라인번호) 포함 여부
 
     Returns:
         설정된 로거 인스턴스
@@ -415,7 +762,7 @@ def setup_logging(service_name: str = "mai-vllm-serving",
 
     # 로그 포맷터 생성
     if use_json:
-        formatter = JsonFormatter(service_name)
+        formatter = JsonFormatter(service_name, include_caller_info)
     else:
         formatter = logging.Formatter(log_format)
 
@@ -460,3 +807,39 @@ def get_request_logger() -> RequestResponseLogger:
     """
     logger = logging.getLogger("mai-vllm-serving.api")
     return RequestResponseLogger(logger)
+
+
+def get_structured_logger(name: str) -> StructuredLogger:
+    """
+    구조화된 로거 인스턴스 가져오기
+
+    Args:
+        name: 로거 이름
+
+    Returns:
+        StructuredLogger 인스턴스
+    """
+    logger = logging.getLogger(name)
+    return StructuredLogger(logger)
+
+
+# 모듈 레벨 싱글톤 구조화 로거 인스턴스
+_structured_loggers = {}
+
+
+def get_logger(name: str) -> StructuredLogger:
+    """
+    구조화된 로거 인스턴스 가져오기 (싱글톤)
+
+    Args:
+        name: 로거 이름
+
+    Returns:
+        StructuredLogger 인스턴스
+    """
+    global _structured_loggers
+
+    if name not in _structured_loggers:
+        _structured_loggers[name] = get_structured_logger(name)
+
+    return _structured_loggers[name]

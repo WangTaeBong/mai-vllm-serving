@@ -37,8 +37,10 @@ from mai_vllm_serving.utils.engine_manager import EngineManager
 # 로깅 유틸리티 임포트
 from mai_vllm_serving.utils.logging_utils import (
     setup_logging,
+    get_logger,
     get_request_logger,
-    TimingContext
+    TimingContext,
+    with_request_context
 )
 
 # 공유 메모리 누수 경고 무시
@@ -52,15 +54,16 @@ warnings.filterwarnings("ignore", message=".*process group has NOT been destroye
 config = get_config()
 
 # 로깅 초기화
-logger = setup_logging(
+root_logger = setup_logging(
     service_name="mai-vllm-serving",
     log_level=config.logging.level,
     use_json=config.logging.json,
-    log_file=config.logging.file
+    log_file=config.logging.file,
+    include_caller_info=True
 )
 
-# 요청/응답 로거 가져오기
-request_logger = get_request_logger()
+# 구조화된 로거 가져오기
+logger = get_logger("mai-vllm-serving.server")
 
 
 # API 요청 모델
@@ -132,8 +135,13 @@ async def lifespan(app_: FastAPI):
         app_: FastAPI 애플리케이션
     """
     try:
-        logger.info("Starting mai-vllm-serving")
-        logger.info(f"Loading model: {config.model.name}")
+        logger.info("Starting mai-vllm-serving",
+                    context={
+                        "startup": {
+                            "model": config.model.name,
+                            "version": "0.1.0"
+                        }
+                    })
 
         # 분산 처리 설정 확인
         if config.distributed.world_size > 1:
@@ -153,12 +161,12 @@ async def lifespan(app_: FastAPI):
                 dist_config.rank = int(os.environ["RANK"])
                 dist_config.local_rank = int(os.environ["LOCAL_RANK"])
 
-            logger.info(f"Distributed config: rank={dist_config.rank}, local_rank={dist_config.local_rank}")
+            logger.debug(f"Distributed config: rank={dist_config.rank}, local_rank={dist_config.local_rank}")
 
             # 분산 모드에서는 양자화 설정 확인
             quant_enabled = config.quantization.enabled
             if quant_enabled:
-                logger.info(f"Using quantization: method={config.quantization.method}, bits={config.quantization.bits}")
+                logger.debug(f"Using quantization: method={config.quantization.method}, bits={config.quantization.bits}")
 
             # 분산 엔진 초기화
             with TimingContext(logger, "Distributed engine initialization") as timing:
@@ -184,7 +192,7 @@ async def lifespan(app_: FastAPI):
             # 양자화 설정 확인
             quant_enabled = config.quantization.enabled
             if quant_enabled:
-                logger.info(f"Using quantization: method={config.quantization.method}, bits={config.quantization.bits}")
+                logger.debug(f"Using quantization: method={config.quantization.method}, bits={config.quantization.bits}")
 
             # 표준 엔진 초기화
             with TimingContext(logger, "Engine initialization") as timing:
@@ -343,6 +351,7 @@ async def request_metrics(request_id: str):
 @app.post("/generate")
 @track_request
 @profile
+@with_request_context
 async def generate(request: GenerationRequest, background_tasks: BackgroundTasks, client_request: Request):
     """
     텍스트 생성 엔드포인트
@@ -355,19 +364,27 @@ async def generate(request: GenerationRequest, background_tasks: BackgroundTasks
     Returns:
         생성된 텍스트와 관련 메타데이터
     """
-    # global llm_engine  # 명시적으로 글로벌 변수 참조
-
     # 요청 ID 생성 및 로깅
     request_id = request.request_id if request.request_id else str(uuid.uuid4())
     client_ip = client_request.client.host if client_request.client else "unknown"
     request_data = request.model_dump()
+
     # 실제 사용될 request_id를 request_data에 업데이트
     request_data['request_id'] = request_id
 
-    request_logger.log_request(
-        request_data=request_data,
-        request_id=request_id,
-        client_ip=client_ip
+    logger.info(f"Request received",
+                context={
+                    "request": {
+                        "prompt_length": len(request.prompt),
+                        "max_tokens": request.max_tokens,
+                        "temperature": request.temperature
+                    }
+                })
+
+    logger.log_api_request(
+        method="POST",
+        endpoint="/generate",
+        params=request_data
     )
 
     # 타이밍 컨텍스트 시작
@@ -412,16 +429,24 @@ async def generate(request: GenerationRequest, background_tasks: BackgroundTasks
                 result = await llm_engine.generate(engine_request)
 
             # 응답 로깅
-            request_logger.log_response(
-                response_data=result,
+            logger.log_api_response(
                 status_code=200,
-                processing_time=timing.duration,
-                request_id=request_id
+                response_time=timing.duration,
+                data=result
             )
 
             return JSONResponse(content=result)
 
     except Exception as e:
+        logger.error("Error processing request",
+                     context={
+                         "error": {
+                             "type": type(e).__name__,
+                             "message": str(e)
+                         }
+                     },
+                     exc_info=True)
+
         # 오류 로깅
         request_logger.log_error(
             error=e,
@@ -453,9 +478,13 @@ async def _stream_response_generator(engine_request: RequestConfig, timing: Timi
 
             # 완료 시 로깅
             if chunk.get("finished", False):
-                logger.info(
-                    f"Streaming request {engine_request.request_id} completed in {timing.duration:.3f}s"
-                )
+                logger.info("Streaming request completed",
+                            context={
+                                "streaming": {
+                                    "duration": timing.duration,
+                                    "tokens_per_second": chunk.get("tokens_per_second", 0)
+                                }
+                            })
 
     except Exception as e:
         logger.error(f"Error in stream generation: {str(e)}", exc_info=True)
@@ -550,8 +579,11 @@ def main():
     timeout = config.server.request_timeout
 
     # 로깅 설정 최종 업데이트
-    logger.info(f"Starting mai-vllm-serving on {host}:{port} with {workers} worker(s)")
-    logger.info(f"Model: {config.model.name}")
+    logger.info("Starting mai-vllm-serving")
+    logger.info(f"Loading model: {config.model.name}")
+
+    # 세부 설정 정보는 DEBUG로 변경
+    logger.debug(f"Server config: host={config.server.host}, port={config.server.port}")
 
     # 분산 처리 모드인 경우 워커 수 확인
     if config.distributed.world_size > 1 and workers > 1:
