@@ -7,6 +7,7 @@ import contextlib
 import functools
 import gc
 import json
+import logging
 import os
 import threading
 import time
@@ -120,7 +121,7 @@ class GPUInfo:
             # NVML 정보 추가 (가능한 경우)
             if PACKAGE_STATUS["nvml"]:
                 try:
-                    with TimingContext(gpu_logger.debug, f"NVML GPU {idx} info collection"):
+                    with TimingContext(gpu_logger, f"NVML GPU {idx} info collection"):
                         nvml.nvmlInit()
                         handle = nvml.nvmlDeviceGetHandleByIndex(idx)
                         info = nvml.nvmlDeviceGetMemoryInfo(handle)
@@ -167,7 +168,7 @@ class MemorySnapshot:
         Returns:
             메모리 스냅샷 객체
         """
-        with TimingContext(memory_logger.debug, "메모리 스냅샷 캡처"):
+        with TimingContext(memory_logger, "메모리 스냅샷 캡처"):
             snapshot = MemorySnapshot()
 
             # 시스템 RAM 정보 수집
@@ -178,12 +179,12 @@ class MemorySnapshot:
 
             # Python 객체 정보 수집 (memory_profiler 필요)
             if PACKAGE_STATUS["memory_profiler"]:
-                with TimingContext(memory_logger.debug, "Python 객체 정보 수집"):
+                with TimingContext(memory_logger, "Python 객체 정보 수집"):
                     snapshot._collect_python_objects()
 
             # GPU 메모리 정보 수집
             if torch.cuda.is_available():
-                with TimingContext(memory_logger.debug, "GPU 메모리 정보 수집"):
+                with TimingContext(memory_logger, "GPU 메모리 정보 수집"):
                     snapshot._collect_gpu_info()
 
             memory_logger.debug("메모리 스냅샷 캡처 완료",
@@ -222,7 +223,7 @@ class MemorySnapshot:
         )
 
         # 객체 분포 로깅 (디버그 수준)
-        if memory_logger.level <= 10:  # DEBUG=10
+        if config.logging.level.upper() == "DEBUG":
             top_obj_info = ", ".join([f"{k}:{v}" for k, v in list(self.python_objects.items())[:5]])
             memory_logger.debug(f"상위 객체 분포: {top_obj_info}")
 
@@ -327,7 +328,7 @@ class SystemProfiler:
         if not self.config.enabled or self._profiling_thread is None:
             return
 
-        with TimingContext(logger.debug, "프로파일링 정리 작업"):
+        with TimingContext(logger, "프로파일링 정리 작업"):
             self._stop_event.set()
             self._profiling_thread.join(timeout=5.0)
             if self._profiling_thread.is_alive():
@@ -350,7 +351,7 @@ class SystemProfiler:
 
                 # 지정된 간격마다 프로파일링 수행
                 if current_time - last_profile_time >= self.config.profile_interval:
-                    with TimingContext(logger.debug, f"프로파일링 실행 #{loop_count}"):
+                    with TimingContext(logger, f"프로파일링 실행 #{loop_count}"):
                         self._perform_profiling()
                     last_profile_time = current_time
 
@@ -370,12 +371,12 @@ class SystemProfiler:
 
         # 메모리 스냅샷 생성
         if self.config.memory_profiling:
-            with TimingContext(memory_logger.debug, "메모리 스냅샷 캡처"):
+            with TimingContext(memory_logger, "메모리 스냅샷 캡처"):
                 self._capture_memory_snapshot()
 
         # PyTorch 프로파일링
         if self.config.torch_profiling and PACKAGE_STATUS["torch_profiler"] and torch.cuda.is_available():
-            with TimingContext(gpu_logger.debug, "PyTorch 연산 프로파일링"):
+            with TimingContext(gpu_logger, "PyTorch 연산 프로파일링"):
                 self._profile_torch_operations()
 
         # 함수 프로파일 통계 로깅
@@ -401,7 +402,7 @@ class SystemProfiler:
 
         # 프로파일 결과 저장
         if self.config.log_to_file:
-            with TimingContext(logger.debug, "프로파일 결과 저장"):
+            with TimingContext(logger, "프로파일 결과 저장"):
                 self._save_profile_results()
 
     def _capture_memory_snapshot(self) -> None:
@@ -415,7 +416,7 @@ class SystemProfiler:
                 self.memory_snapshots.pop(0)
 
             # 상세 로깅
-            if self.config.verbose or memory_logger.level <= 20:  # INFO=20
+            if self.config.verbose or config.logging.level.upper() == "DEBUG":
                 memory_logger.info(f"메모리 스냅샷: 프로세스 RAM: {memory_snapshot.process_ram_used_gb:.2f} GB, "
                                    f"시스템 RAM: {memory_snapshot.system_ram_percent:.1f}%")
         except Exception as err:
@@ -458,7 +459,7 @@ class SystemProfiler:
         """PyTorch 프로파일러 세션 시작"""
         profile_path = os.path.join(self.config.profile_dir, f"torch_profile_{int(time.time())}")
 
-        with TimingContext(gpu_logger.debug, "PyTorch 프로파일러 세션 초기화"):
+        with TimingContext(gpu_logger, "PyTorch 프로파일러 세션 초기화"):
             self.torch_profiler_session = torch_profiler.profile(
                 activities=[
                     torch_profiler.ProfilerActivity.CPU,
@@ -571,7 +572,7 @@ class SystemProfiler:
                     # 프로파일 업데이트
                     self.function_profiles[key].update(timing.duration)
 
-                    if self.config.verbose or function_logger.level <= 10:  # DEBUG=10
+                    if self.config.verbose or config.logging.level.upper() == "DEBUG":
                         function_logger.debug(f"함수 {key} 실행 완료",
                                               context={
                                                   "duration": f"{timing.duration:.6f}s",
@@ -590,7 +591,7 @@ class SystemProfiler:
         if not self.config.enabled:
             return {"status": "profiler_disabled"}
 
-        with TimingContext(memory_logger.debug, "메모리 보고서 생성"):
+        with TimingContext(memory_logger, "메모리 보고서 생성"):
             try:
                 # 최신 스냅샷 생성
                 current_snapshot = MemorySnapshot.capture()
@@ -684,7 +685,7 @@ class SystemProfiler:
         if not self.config.enabled:
             return {"status": "profiler_disabled"}
 
-        with TimingContext(function_logger.debug, "함수 통계 보고서 생성"):
+        with TimingContext(function_logger, "함수 통계 보고서 생성"):
             try:
                 # 총 실행 시간 기준 정렬
                 sorted_profiles = sorted(
@@ -737,7 +738,7 @@ class SystemProfiler:
         Returns:
             시스템 상태 보고서
         """
-        with TimingContext(logger.debug, "시스템 상태 통계 수집"):
+        with TimingContext(logger, "시스템 상태 통계 수집"):
             try:
                 # CPU 정보 수집
                 cpu_stats = cls._collect_cpu_stats()
@@ -794,7 +795,7 @@ class SystemProfiler:
     @staticmethod
     def _collect_cpu_stats() -> Dict[str, Any]:
         """CPU 통계 수집"""
-        with TimingContext(logger.debug, "CPU 통계 수집"):
+        with TimingContext(logger, "CPU 통계 수집"):
             cpu_percent = psutil.cpu_percent(interval=0.1)
             count_logical = psutil.cpu_count()
             count_physical = psutil.cpu_count(logical=False)
@@ -818,7 +819,7 @@ class SystemProfiler:
     @staticmethod
     def _collect_memory_stats() -> Dict[str, Any]:
         """메모리 통계 수집"""
-        with TimingContext(memory_logger.debug, "메모리 통계 수집"):
+        with TimingContext(memory_logger, "메모리 통계 수집"):
             mem = psutil.virtual_memory()
             memory_stats = {
                 "total_gb": mem.total / (1024 ** 3),
@@ -839,7 +840,7 @@ class SystemProfiler:
     @staticmethod
     def _collect_disk_stats() -> Dict[str, Any]:
         """디스크 통계 수집"""
-        with TimingContext(logger.debug, "디스크 통계 수집"):
+        with TimingContext(logger, "디스크 통계 수집"):
             disk = psutil.disk_usage('/')
             disk_stats = {
                 "total_gb": disk.total / (1024 ** 3),
@@ -867,7 +868,7 @@ class SystemProfiler:
     @staticmethod
     def _collect_process_stats() -> Dict[str, Any]:
         """현재 프로세스 통계 수집"""
-        with TimingContext(logger.debug, "프로세스 통계 수집"):
+        with TimingContext(logger, "프로세스 통계 수집"):
             pid = os.getpid()
             process = psutil.Process(pid)
             process_stats = {
@@ -894,7 +895,7 @@ class SystemProfiler:
     @staticmethod
     def _collect_gpu_stats() -> List[Dict[str, Any]]:
         """GPU 통계 수집"""
-        with TimingContext(gpu_logger.debug, "GPU 통계 수집"):
+        with TimingContext(gpu_logger, "GPU 통계 수집"):
             gpu_stats = []
             for idx in range(torch.cuda.device_count()):
                 gpu_info = {
@@ -1142,7 +1143,7 @@ class ProfilerTestUtils:
         """CPU 부하 테스트 함수"""
         logger.info(f"CPU 부하 테스트 시작 (n={iterations})")
 
-        with TimingContext(logger.debug, "CPU 부하 테스트") as timing:
+        with TimingContext(logger, "CPU 부하 테스트") as timing:
             result = 0
             for idx in range(iterations):
                 result += idx ** 2
@@ -1160,7 +1161,7 @@ class ProfilerTestUtils:
         """메모리 사용량 테스트 함수"""
         memory_logger.info(f"메모리 테스트 시작 (size={size_mb}MB)")
 
-        with TimingContext(memory_logger.debug, "메모리 할당 테스트") as timing:
+        with TimingContext(memory_logger, "메모리 할당 테스트") as timing:
             try:
                 # size_mb 크기의 메모리 할당
                 data = [0] * (size_mb * 131072)  # 약 1MB = 1024 * 1024 / 8 (bytes per int)
@@ -1188,7 +1189,7 @@ class ProfilerTestUtils:
 
         gpu_logger.info(f"GPU 테스트 시작 (크기: {tensor_size}x{tensor_size})")
 
-        with TimingContext(gpu_logger.debug, "GPU 행렬 곱셈 테스트") as timing:
+        with TimingContext(gpu_logger, "GPU 행렬 곱셈 테스트") as timing:
             try:
                 x = torch.rand(tensor_size, tensor_size, device="cuda")
                 y = torch.rand(tensor_size, tensor_size, device="cuda")
@@ -1222,15 +1223,15 @@ class ProfilerTestUtils:
             os.makedirs(t_output_dir, exist_ok=True)
 
             # 메모리 스냅샷 시각화
-            with TimingContext(memory_logger.debug, "메모리 사용량 시각화"):
+            with TimingContext(memory_logger, "메모리 사용량 시각화"):
                 ProfilerTestUtils._visualize_memory_usage(t_profiler, t_output_dir)
 
             # GPU 메모리 시각화
-            with TimingContext(gpu_logger.debug, "GPU 메모리 시각화"):
+            with TimingContext(gpu_logger, "GPU 메모리 시각화"):
                 ProfilerTestUtils._visualize_gpu_memory(t_profiler, t_output_dir)
 
             # 함수 실행 시간 시각화
-            with TimingContext(function_logger.debug, "함수 실행 시간 시각화"):
+            with TimingContext(function_logger, "함수 실행 시간 시각화"):
                 ProfilerTestUtils._visualize_function_times(t_profiler, t_output_dir)
 
             logger.info(f"결과 시각화 완료: {t_output_dir}")
@@ -1433,23 +1434,19 @@ if __name__ == "__main__":
 
             # 다양한 크기로 GPU 테스트 실행
             for size_t in [1000, 2000, 3000]:
-                with TimingContext(gpu_logger.debug, f"GPU 테스트 (크기: {size_t})"):
+                with TimingContext(gpu_logger, f"GPU 테스트 (크기: {size_t})"):
                     ProfilerTestUtils.run_gpu_test(size_t)
                 time.sleep(1)  # GPU 메모리 해제를 위한 지연
-
 
         # 동기 방식으로 시스템 상태를 가져오는 래퍼 함수
         def get_sync_system_stats():
             return asyncio.run(SystemProfiler.get_system_stats())
 
-
         def get_sync_memory_report():
             return asyncio.run(profiler.get_memory_report())
 
-
         def get_sync_function_stats():
             return asyncio.run(profiler.get_function_stats(top_n=5))
-
 
         # 테스트 실행
         logger.info("===== 테스트 시작 =====")

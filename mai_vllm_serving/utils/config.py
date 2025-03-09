@@ -28,7 +28,7 @@ DEFAULT_CONFIG_PATH = os.path.join(
 class ServerConfig:
     """서버 설정 클래스"""
     host: str = "0.0.0.0"
-    port: int = 8000
+    port: int = 8020
     workers: int = 1
     log_level: str = "info"
     request_timeout: int = 300
@@ -95,13 +95,13 @@ class TokenizerConfig:
 @dataclass
 class InferenceConfig:
     """추론 설정 클래스"""
-    max_tokens: int = 512
-    temperature: float = 0.7
+    max_tokens: int = 1024
+    temperature: float = 0.1
     top_p: float = 0.9
     top_k: int = 50
     frequency_penalty: float = 0.0
-    presence_penalty: float = 0.0
-    repetition_penalty: float = 1.0
+    presence_penalty: float = 0.2
+    repetition_penalty: float = 1.1
     no_repeat_ngram_size: int = 0
     seed: Optional[int] = None
 
@@ -132,10 +132,15 @@ class LoggingConfig:
     """로깅 설정 클래스"""
     level: str = "info"
     format: str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    datefmt: str = "%Y-%m-%d %H:%M:%S"
     file: Optional[str] = None
     json: bool = False
     log_requests: bool = True
     log_responses: bool = False
+    max_log_size_mb: int = 100
+    log_backup_count: int = 30
+    log_compression: bool = True
+    log_retention_days: int = 90
 
 
 @dataclass
@@ -215,9 +220,9 @@ def load_yaml_config(config_path: str) -> Dict[str, Any]:
     """
     try:
         with open(config_path, 'r', encoding='utf-8') as f:
-            config = yaml.safe_load(f)
+            config_obj = yaml.safe_load(f)
         logger.info(f"Loaded configuration from {config_path}")
-        return config
+        return config_obj
     except FileNotFoundError:
         logger.error(f"Configuration file not found: {config_path}")
         raise
@@ -246,23 +251,23 @@ def load_config(config_path: Optional[str] = None) -> MAIVLLMConfig:
     config_dict = override_config_from_env(config_dict)
 
     # MAIVLLMConfig 객체 생성
-    config = MAIVLLMConfig.from_dict(config_dict)
+    config_obj = MAIVLLMConfig.from_dict(config_dict)
 
-    return config
+    return config_obj
 
 
-def override_config_from_env(config: Dict[str, Any]) -> Dict[str, Any]:
+def override_config_from_env(config_obj: Dict[str, Any]) -> Dict[str, Any]:
     """
     환경 변수로 설정 덮어쓰기
 
     Args:
-        config: 설정 딕셔너리
+        config_obj: 설정 딕셔너리
 
     Returns:
         환경 변수로 덮어쓴 설정 딕셔너리
     """
     # 설정 복사
-    config_copy = copy.deepcopy(config)
+    config_copy = copy.deepcopy(config_obj)
 
     # 환경 변수 처리
     env_var_prefix = "VLLM_"

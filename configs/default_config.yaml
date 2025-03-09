@@ -20,18 +20,18 @@ model:
 
 # vLLM 엔진 설정
 engine:
-  tensor_parallel_size: 2     # L40s 2개 사용
-  pipeline_parallel_size: 1   # 파이프라인 병렬 처리에 사용할 GPU 수
-  gpu_memory_utilization: 0.7  # L40s의 메모리 활용도 최적화
-  max_model_len: 12288       # RAG 시스템에 충분한 컨텍스트
-  max_num_seqs: 32           # 다중 언어 처리 및 코딩을 위해 배치 크기 조정
+  tensor_parallel_size: 2        # L40s 2개 사용
+  pipeline_parallel_size: 1      # 파이프라인 병렬 처리에 사용할 GPU 수
+  gpu_memory_utilization: 0.7    # L40s의 메모리 활용도 최적화
+  max_model_len: 12288           # RAG 시스템에 충분한 컨텍스트
+  max_num_seqs: 32               # 다중 언어 처리 및 코딩을 위해 배치 크기 조정
   max_num_batched_tokens: 12288  # 큰 컨텍스트 윈도우 활용 (128K)
-  block_size: 16             # KV 캐시 블록 크기 증가 (긴 컨텍스트용)
-  swap_space: 32             # CPU 스왑 공간 크기 (GB)
-  enforce_eager: false       # PyTorch eager 모드 강제 실행 여부
-  disable_log_stats: false   # 통계 로깅 비활성화 여부
-  dtype: "bfloat16"          # config.json과 일치하는 데이터 타입
-  sliding_window: null       # config.json과 일치시킴
+  block_size: 16                 # KV 캐시 블록 크기 증가 (긴 컨텍스트용)
+  swap_space: 32                 # CPU 스왑 공간 크기 (GB)
+  enforce_eager: false           # PyTorch eager 모드 강제 실행 여부
+  disable_log_stats: false       # 통계 로깅 비활성화 여부
+  dtype: "bfloat16"              # config.json과 일치하는 데이터 타입
+  sliding_window: null           # config.json과 일치시킴
 
 # 양자화 설정
 quantization:
@@ -70,7 +70,7 @@ inference:
 
 # 모니터링 설정
 monitoring:
-  enabled: true              # 모니터링 활성화 여부
+  enabled: false             # 모니터링 활성화 여부
   metrics_port: 8005         # 메트릭 서버 포트
   log_stats_interval: 10     # 통계 로깅 간격 (초)
   profile_interval: 60       # 프로파일링 간격 (초)
@@ -87,9 +87,14 @@ caching:
 
 # 로깅 설정
 logging:
-  level: "info"              # 로깅 레벨
-  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"  # 로그 형식
+  level: "info"                        # 로깅 레벨
+  format: "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"  # 로그 형식
+  datefmt: "%Y-%m-%d %H:%M:%S"         # 날짜/시간 형식 (마이크로초 제외)
   file: "./logs/mai-vllm-serving.log"  # 로그 파일 경로
-  json: false                 # JSON 형식 로깅 활성화
-  log_requests: true         # 요청 로깅 여부
-  log_responses: true        # 응답 로깅 여부
+  json: false                          # JSON 형식 로깅 활성화
+  log_requests: true                   # 요청 로깅 여부
+  log_responses: true                  # 응답 로깅 여부
+  max_log_size_mb: 100                 # 로그 파일 최대 크기 (MB)
+  log_backup_count: 30                 # 유지할 백업 파일 수
+  log_compression: true                # 오래된 로그 파일 압축 여부
+  log_retention_days: 90               # 로그 보관 기간 (일)
