@@ -970,7 +970,7 @@ def with_request_context(func: Optional[Callable] = None, request_id_arg: str = 
                 request_id = str(uuid.uuid4())
 
             logger.set_request_id(request_id)
-            logger.info(f"Request {request_id} started")
+            logger.info(f"Request {request_id} started: with_request_context")
 
             # 시작 시간 기록
             start_time = time.time()
@@ -1171,11 +1171,26 @@ def setup_logging(service_name: str = "mai-vllm-serving",
     for handler in logger.handlers[:]:
         logger.removeHandler(handler)
 
+    # 이 부분에 로거 이름 매핑 기능을 추가한 사용자 정의 Formatter 클래스 추가
+    class CustomFormatter(logging.Formatter):
+        def format(self, record):
+            # 로거 이름 매핑
+            if record.name == "__main__":
+                record.name = "m_logger"
+            elif record.name == "mai_vllm_serving.engine":
+                record.name = "engine"
+            elif record.name == "mai-vllm-serving.api":
+                record.name = "api"
+            elif record.name == "mai_vllm_serving.utils.logging_utils":
+                record.name = "logging.utils"
+
+            return super().format(record)
+
     # 로그 포맷터 생성
     if use_json:
         formatter = JsonFormatter(service_name, include_caller_info)
     else:
-        formatter = logging.Formatter(log_format, datefmt=config.logging.datefmt)
+        formatter = CustomFormatter(log_format, datefmt=config.logging.datefmt)
 
     # 로그 파일이 지정된 경우 고급 파일 핸들러 추가
     if log_file:
@@ -1221,7 +1236,7 @@ def get_request_logger() -> RequestResponseLogger:
     Returns:
         RequestResponseLogger 인스턴스
     """
-    logger = logging.getLogger("mai-vllm-serving.api")
+    logger = logging.getLogger("req.api")
     return RequestResponseLogger(logger)
 
 

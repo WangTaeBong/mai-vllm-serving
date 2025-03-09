@@ -88,7 +88,7 @@ caching:
 # 로깅 설정
 logging:
   level: "info"                        # 로깅 레벨
-  format: "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"  # 로그 형식
+  format: "%(asctime)s | %(levelname)-8s | %(name)-8s | %(message)s"  # 로그 형식
   datefmt: "%Y-%m-%d %H:%M:%S"         # 날짜/시간 형식 (마이크로초 제외)
   file: "./logs/mai-vllm-serving.log"  # 로그 파일 경로
   json: false                          # JSON 형식 로깅 활성화

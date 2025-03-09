@@ -326,12 +326,12 @@ class MAIVLLMEngine:
         logger.set_request_id(req_config.request_id)
 
         logger.info(
-            f"Request received",
+            f"Request generate received {req_config.request_id}",
             context=request_context
         )
 
         # 타이밍 컨텍스트 시작
-        with TimingContext(logger, f"Request processing") as timing:
+        with TimingContext(logger, f"Request generate processing") as timing:
             # 요청 통계 초기화
             self.inference_stats[req_config.request_id] = InferenceStats(
                 request_id=req_config.request_id,
@@ -573,7 +573,7 @@ class MAIVLLMEngine:
                     # 로깅 - 구조화된 형식으로 변경
                     tokens_per_sec = tokens_generated / timing.duration if timing.duration > 0 else 0
                     logger.info(
-                        f"Streaming request completed",
+                        f"Streaming request completed: {request_id}",
                         context={
                             "streaming": {
                                 "tokens_generated": tokens_generated,

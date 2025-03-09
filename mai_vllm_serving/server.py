@@ -532,7 +532,7 @@ async def generate(
     logger.set_request_id(request_id)
 
     # 상세한 요청 로깅
-    logger.info(f"Generation request received",
+    logger.info(f"Generation request received: {request_id}",
                 context={
                     "request": {
                         "id": request_id,
@@ -578,7 +578,7 @@ async def generate(
                 # 백그라운드에서 요청 종료 로깅
                 background_tasks.add_task(
                     lambda msg, req_id: logger.info(msg, context={"request_id": req_id}),
-                    f"Streaming request started",
+                    f"Streaming request started: {request_id}",
                     request_id
                 )
 
@@ -681,7 +681,7 @@ async def _stream_response_generator(engine_request: RequestConfig, timing: Timi
                 stream_duration = time.time() - stream_start_time
                 tokens_per_second = token_count / stream_duration if stream_duration > 0 else 0
 
-                logger.info("Streaming request completed",
+                logger.info(f"Streaming request completed: {request_id}",
                             context={
                                 "streaming": {
                                     "request_id": request_id,
