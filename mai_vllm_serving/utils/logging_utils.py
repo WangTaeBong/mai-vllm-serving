@@ -123,7 +123,12 @@ class LogRotationPolicy:
                     compressed_path = full_path + '.gz'
                     with open(full_path, 'rb') as f_in:
                         with gzip.open(compressed_path, 'wb') as f_out:
-                            shutil.copyfileobj(f_in, f_out)
+                            chunk_size = 1024 * 1024  # 1MB 단위로 처리
+                            while True:
+                                chunk = f_in.read(chunk_size)
+                                if not chunk:
+                                    break
+                                f_out.write(chunk)
 
                     # 원본 크기와 압축 후 크기 비교
                     compressed_size = os.stat(compressed_path).st_size / (1024 * 1024)
@@ -300,11 +305,12 @@ class AdvancedRotatingFileHandler(TimedRotatingFileHandler):
 
             # 크기 제한 초과 시 회전
             if current_size >= self.max_size_bytes:
-                self.stream.close()
-                self.stream = None
+                if self.stream is not None:
+                    self.stream.close()
+                self.stream = None  # type: ignore
                 self.doRollover()
                 # 새 파일 열기
-                if not self.stream:
+                if self.stream is None:
                     self.stream = self._open()
 
             # 로그 레코드 처리
@@ -332,8 +338,9 @@ class AdvancedRotatingFileHandler(TimedRotatingFileHandler):
 
         # 파일 닫기
         if self.stream:
-            self.stream.close()
-            self.stream = None
+            if self.stream is not None:
+                self.stream.close()
+            self.stream = None  # type: ignore
 
         try:
             # 파일 이름 변경 대신 복사 후 원본 비우기
@@ -398,7 +405,12 @@ class AdvancedRotatingFileHandler(TimedRotatingFileHandler):
                     if time.time() - file_mtime >= 86400:  # 24시간
                         with open(log_path, 'rb') as f_in:
                             with gzip.open(gz_path, 'wb') as f_out:
-                                shutil.copyfileobj(f_in, f_out)
+                                chunk_size = 1024 * 1024  # 1MB 단위로 처리
+                                while True:
+                                    chunk = f_in.read(chunk_size)
+                                    if not chunk:
+                                        break
+                                    f_out.write(chunk)
 
                         # 압축 성공 시 원본 삭제
                         if os.path.exists(gz_path):
@@ -754,7 +766,7 @@ class StructuredLogger:
         """로깅 컨텍스트 초기화"""
         self.thread_local.context = {}
 
-    def set_request_id(self, request_id: str) -> None:
+    def set_request_id(self, request_id: Optional[str]) -> None:
         """
         현재 스레드의 요청 ID 설정
 
@@ -1354,7 +1366,8 @@ def cleanup_logs(log_dir: Optional[str] = None,
                 result["stats"]["deleted_count"] += 1
                 result["stats"]["space_saved_bytes"] += file_size
                 logger.info(
-                    f"Deleted old log file: {filename} (age: {(datetime.now().timestamp() - file_mtime) / 86400:.1f} days)")
+                    f"Deleted old log file: {filename} "
+                    f"(age: {(datetime.now().timestamp() - file_mtime) / 86400:.1f} days)")
 
             # 압축되지 않은 오래된 로그 파일 압축
             elif (not filename.endswith('.gz') and
@@ -1365,7 +1378,12 @@ def cleanup_logs(log_dir: Optional[str] = None,
                     compressed_path = file_path + '.gz'
                     with open(file_path, 'rb') as f_in:
                         with gzip.open(compressed_path, 'wb') as f_out:
-                            shutil.copyfileobj(f_in, f_out)
+                            chunk_size = 1024 * 1024  # 1MB 단위로 처리
+                            while True:
+                                chunk = f_in.read(chunk_size)
+                                if not chunk:
+                                    break
+                                f_out.write(chunk)
 
                     # 압축 성공하면 원본 삭제
                     if os.path.exists(compressed_path):
@@ -1548,12 +1566,12 @@ def parse_log_level(level_str: str) -> int:
 
 
 # 설정 파일에 로그 회전 설정 추가 함수
-def update_config_with_log_rotation_settings(config_file: str = None) -> bool:
+def update_config_with_log_rotation_settings(app_config_file: str = None) -> bool:
     """
     설정 파일에 로그 회전 관련 설정 추가
 
     Args:
-        config_file: 설정 파일 경로 (None인 경우 기본 설정 파일 사용)
+        app_config_file: 설정 파일 경로 (None인 경우 기본 설정 파일 사용)
 
     Returns:
         성공 여부
@@ -1562,12 +1580,12 @@ def update_config_with_log_rotation_settings(config_file: str = None) -> bool:
     from mai_vllm_serving.utils.config import DEFAULT_CONFIG_PATH
 
     # 설정 파일 경로 결정
-    if config_file is None:
-        config_file = DEFAULT_CONFIG_PATH
+    if app_config_file is None:
+        app_config_file = DEFAULT_CONFIG_PATH
 
     try:
         # 설정 파일 읽기
-        with open(config_file, 'r', encoding='utf-8') as f:
+        with open(app_config_file, 'r', encoding='utf-8') as f:
             config_data = yaml.safe_load(f)
 
         # 로깅 섹션이 없으면 추가
@@ -1596,18 +1614,18 @@ def update_config_with_log_rotation_settings(config_file: str = None) -> bool:
 
         # 변경된 경우에만 저장
         if was_updated:
-            with open(config_file, 'w', encoding='utf-8') as f:
+            with open(app_config_file, 'w', encoding='utf-8') as f:
                 yaml.dump(config_data, f, default_flow_style=False, allow_unicode=True)
 
             logger = logging.getLogger(__name__)
-            logger.info(f"설정 파일 {config_file}에 로그 회전 설정이 추가되었습니다")
+            logger.info(f"설정 파일 {app_config_file}에 로그 회전 설정이 추가되었습니다")
             return True
 
         return False
 
     except Exception as e:
         logger = logging.getLogger(__name__)
-        logger.error(f"설정 파일 {config_file} 업데이트 중 오류 발생: {str(e)}")
+        logger.error(f"설정 파일 {app_config_file} 업데이트 중 오류 발생: {str(e)}")
         return False
 
 
