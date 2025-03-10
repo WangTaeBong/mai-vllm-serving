@@ -30,8 +30,11 @@ from mai_vllm_serving.utils.logging_utils import (
 # 설정 객체 가져오기
 config = get_config()
 
+# 성능 모드 여부 확인
+performance_mode = config.logging.log_performance_mode
+
 # 구조화된 로거 초기화
-logger = get_logger("distributed")
+logger = get_logger("distributed", production_mode=performance_mode)
 
 
 @dataclass
@@ -149,11 +152,22 @@ class DistributedVLLMEngine:
             }
         }
 
-        # 마스터 노드에서만 INFO 레벨 로깅, 다른 노드는 DEBUG 레벨로 로깅
-        if self.is_master:
-            logger.info("Initializing distributed vLLM engine", context=dist_context)
+        # 성능 모드이면서 마스터 노드가 아닌 경우 로깅 최소화
+        if performance_mode and not self.is_master:
+            # 마스터가 아닌 노드는 경량 로깅
+            logger.debug("Initializing distributed worker node",
+                         context={
+                             "distributed": {
+                                 "rank": self.rank,
+                                 "is_master": False
+                             }
+                         })
         else:
-            logger.debug("Initializing distributed vLLM engine worker", context=dist_context)
+            # 마스터 노드에서만 INFO 레벨 로깅
+            if self.is_master:
+                logger.info("Initializing distributed vLLM engine", context=dist_context)
+            else:
+                logger.debug("Initializing distributed vLLM engine worker", context=dist_context)
 
         # 모델 이름 설정
         self.model_name = model_name or config.model.name
@@ -187,7 +201,8 @@ class DistributedVLLMEngine:
             self._log_initialization_params()
 
         # 엔진 초기화 시간 측정
-        with TimingContext(logger if self.is_master else None, "Engine initialization") as timing:
+        with TimingContext(logger if self.is_master else None, "Engine initialization",
+                           log_threshold=0.5 if performance_mode else None) as timing:
             if not dist.is_initialized():
                 self._init_distributed()
 
@@ -232,14 +247,16 @@ class DistributedVLLMEngine:
     @classmethod
     def shutdown(cls):
         """분산 엔진 종료 및 리소스 정리"""
-        shutdown_context = {
-            "shutdown": {
-                "component": "distributed_engine",
-                "status": "starting"
-            }
-        }
-
-        logger.info("Shutting down distributed environment", context=shutdown_context)
+        # 성능 모드에서는 로깅 최소화
+        if not performance_mode:
+            logger.info("Shutting down distributed environment", context={
+                "shutdown": {
+                    "component": "distributed_engine",
+                    "status": "starting"
+                }
+            })
+        else:
+            logger.info("Shutting down distributed environment")
 
         if dist.is_initialized():
             try:
@@ -334,8 +351,8 @@ class DistributedVLLMEngine:
                                    swap_space, trust_remote_code,
                                    dtype, enforce_eager):
         """설정값 검증 및 기본값 설정"""
-        # 구조화된 컨텍스트 준비
-        validation_context = {"validation": {"component": "distributed_engine"}}
+        # 구조화된 컨텍스트 준비 - 성능 모드에서는 생략
+        validation_context = {} if performance_mode else {"validation": {"component": "distributed_engine"}}
 
         # 텐서 병렬 크기 검증은 별도 메서드에서 수행
         self._validate_tensor_parallel_size(tensor_parallel_size)
@@ -476,7 +493,7 @@ class DistributedVLLMEngine:
             )
             self.quantization = None
 
-        if self.is_master:
+        if self.is_master and not performance_mode:
             logger.debug(
                 "Parameter validation completed",
                 context=validation_context
@@ -492,15 +509,20 @@ class DistributedVLLMEngine:
             num_gpus = torch.cuda.device_count()
 
             if self.is_master:
-                logger.info(
-                    f"Using distributed mode",
-                    context={
-                        "distributed": {
-                            "processes": self.world_size,
-                            "gpus_per_node": num_gpus
+                if performance_mode:
+                    logger.info(f"Using distributed mode", context={
+                        "distributed": {"processes": self.world_size}
+                    })
+                else:
+                    logger.info(
+                        f"Using distributed mode",
+                        context={
+                            "distributed": {
+                                "processes": self.world_size,
+                                "gpus_per_node": num_gpus
+                            }
                         }
-                    }
-                )
+                    )
 
             # 각 프로세스의 GPU 할당 정보
             gpu_name = torch.cuda.get_device_name(self.local_rank)
@@ -815,13 +837,16 @@ class DistributedVLLMEngine:
     def _sync_distributed(self):
         """분산 환경 동기화"""
         if dist.is_initialized():
-            if self.is_master:
+            # 마스터 노드이고 성능 모드가 아닌 경우만 상세 로깅
+            should_log = self.is_master and not performance_mode
+
+            if should_log:
                 logger.info("Synchronizing distributed processes...")
 
-            with TimingContext(logger if self.is_master else None, "Distributed synchronization") as timing:
+            with TimingContext(logger if should_log else None, "Distributed synchronization") as timing:
                 try:
                     dist.barrier()
-                    if self.is_master:
+                    if should_log:
                         logger.info(
                             "Distributed processes synchronized",
                             context={
@@ -834,6 +859,7 @@ class DistributedVLLMEngine:
                             }
                         )
                 except Exception as e:
+                    # 오류는 항상 로깅
                     logger.error(
                         "Error during distributed synchronization",
                         context={
@@ -886,15 +912,14 @@ class DistributedVLLMEngine:
             rank=self.rank
         )
 
-        # 요청 정보 로깅 - 마스터 노드에서만 INFO 수준으로
-        log_method = logger.info if self.is_master else logger.debug
+        # 요청 정보 로깅 - 마스터 노드에서만 INFO 수준으로, 성능 모드 고려
+        log_method = logger.info if (self.is_master and not performance_mode) else logger.debug
         log_method(
             "Request received",
             context={
                 "request": {
                     "id": request_id,
                     "prompt_length": len(req_config.prompt),
-                    "max_tokens": req_config.max_tokens,
                     "stream": req_config.stream
                 }
             }
@@ -1249,17 +1274,13 @@ class DistributedVLLMEngine:
                         is_first_response = False
 
                     # 배치 전송 로깅 - TRACE 수준으로 간주하고 DEBUG에서만 상세 정보
-                    if config.logging.level.upper() == "DEBUG":
-                        logger.debug(
-                            "Sending stream batch",
-                            context={
-                                "streaming": {
-                                    "batch_size": len(current_batch),
-                                    "is_first": is_first_response,
-                                    "is_finished": is_finished
-                                }
+                    if not performance_mode and config.logging.level.upper() == "DEBUG":
+                        logger.debug(f"Stream chunk received", context={
+                            "streaming": {
+                                "new_text_length": len(new_text),
+                                "total_text_length": len(current_text)
                             }
-                        )
+                        })
 
                     # 배치 전송
                     yield response

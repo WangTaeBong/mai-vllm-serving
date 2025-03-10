@@ -98,3 +98,5 @@ logging:
   log_backup_count: 30                 # 유지할 백업 파일 수
   log_compression: true                # 오래된 로그 파일 압축 여부
   log_retention_days: 90               # 로그 보관 기간 (일)
+  log_performance_mode: true           # 로그 퍼포먼스 모드
+  log_sampling_rate: 1.0               # 로그 샘플링 레이트

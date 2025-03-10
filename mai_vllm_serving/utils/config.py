@@ -141,6 +141,8 @@ class LoggingConfig:
     log_backup_count: int = 30
     log_compression: bool = True
     log_retention_days: int = 90
+    log_performance_mode: bool = True
+    log_sampling_rate: float = 1.0
 
 
 @dataclass

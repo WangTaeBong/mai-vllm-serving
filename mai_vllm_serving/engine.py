@@ -28,8 +28,11 @@ from mai_vllm_serving.utils.logging_utils import (
 # 설정 객체 가져오기
 config = get_config()
 
+# 성능 모드 여부 확인
+performance_mode = config.logging.log_performance_mode
+
 # 구조화된 로거 초기화로 변경
-logger = get_logger("engine")
+logger = get_logger("engine", production_mode=performance_mode)
 
 
 @dataclass
@@ -171,7 +174,8 @@ class MAIVLLMEngine:
                 })
 
             # 모든 GPU 정보를 한 번에 로깅
-            logger.debug("GPU details", context={"hardware": {"gpus": gpu_info}})
+            if not performance_mode:
+                logger.debug("GPU details", context={"hardware": {"gpus": gpu_info}})
         else:
             self.num_gpus = 0
             logger.warning(
@@ -261,7 +265,7 @@ class MAIVLLMEngine:
         )
 
         # 엔진 초기화
-        with TimingContext(logger, "Engine initialization") as timing:
+        with TimingContext(logger, "Engine initialization", log_threshold=0.1 if performance_mode else None) as timing:
             try:
                 with profile_block("engine_initialization"):  # 프로파일링 블록 추가
                     self.engine = AsyncLLMEngine.from_engine_args(engine_args)
@@ -405,17 +409,18 @@ class MAIVLLMEngine:
                     )
 
                 # 로깅 - 구조화된 형식으로 변경
-                logger.info(
-                    f"Request completed",
-                    context={
-                        "performance": {
-                            "prompt_tokens": stats.prompt_tokens,
-                            "completion_tokens": stats.completion_tokens,
-                            "inference_time": stats.inference_time,
-                            "tokens_per_second": stats.tokens_per_second
+                if not performance_mode or stats.inference_time > 0.5:  # 500ms 이상 걸린 요청만 로깅
+                    logger.info(
+                        f"Request completed",
+                        context={
+                            "performance": {
+                                "prompt_tokens": stats.prompt_tokens,
+                                "completion_tokens": stats.completion_tokens,
+                                "inference_time": stats.inference_time,
+                                "tokens_per_second": stats.tokens_per_second
+                            }
                         }
-                    }
-                )
+                    )
 
                 return {
                     "id": req_config.request_id,
@@ -511,15 +516,17 @@ class MAIVLLMEngine:
                 new_text = current_text[previous_text_length:]
                 previous_text_length = len(current_text)
 
-                # 매우 상세한 로깅은 TRACE 레벨로 간주하고 DEBUG에서만 출력
-                if config.logging.level.upper() == "DEBUG":
-                    logger.debug(f"Stream chunk received", context={
-                        "streaming": {
-                            "new_text_length": len(new_text),
-                            "total_text_length": len(current_text),
-                            "tokens_generated": tokens_generated
+                # 디버그 로깅 - 상세하지만 TRACE 수준 정보는 조건부로
+                if not performance_mode and config.logging.level.upper() == "DEBUG" and tokens_generated % 10 == 0:
+                    logger.debug(
+                        "Stream progress",
+                        context={
+                            "streaming": {
+                                "tokens_generated": tokens_generated,
+                                "new_text_length": len(new_text)
+                            }
                         }
-                    })
+                    )
 
                 # 새 텍스트를 현재 배치에 추가
                 current_batch += new_text

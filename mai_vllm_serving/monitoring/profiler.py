@@ -54,13 +54,16 @@ PACKAGE_STATUS = {
 # 설정 객체 가져오기
 config = get_config()
 
+# 성능 모드 여부 확인
+performance_mode = config.logging.log_performance_mode
+
 # 구조화된 로거 가져오기 (로깅 유틸리티 사용)
-logger = get_logger("profiler")
+logger = get_logger("profiler", production_mode=performance_mode)
 
 # 세부 로깅을 위한 서브 로거들
-memory_logger = get_logger("profiler.memory")
-function_logger = get_logger("profiler.function")
-gpu_logger = get_logger("profiler.gpu")
+memory_logger = get_logger("profiler.memory", production_mode=performance_mode)
+function_logger = get_logger("profiler.function", production_mode=performance_mode)
+gpu_logger = get_logger("profiler.gpu", production_mode=performance_mode)
 
 
 @dataclass
@@ -254,6 +257,7 @@ class ProfilerConfig:
     log_to_file: bool = True  # 파일에 프로파일 결과 기록 여부
     profile_dir: str = "./profiles"  # 프로파일 결과 저장 디렉토리
     verbose: bool = False  # 상세 로깅 여부
+    lightweight_mode: bool = False  # 성능 최적화 모드 여부
 
 
 class SystemProfiler:
@@ -272,6 +276,12 @@ class SystemProfiler:
         """
         self.config = p_config or ProfilerConfig()
 
+        # 성능 모드에서는 자동으로 경량 모드 활성화
+        if performance_mode and not self.config.lightweight_mode:
+            self.config.lightweight_mode = True
+            self.config.profile_interval = max(120, self.config.profile_interval)  # 최소 2분 간격
+            self.config.verbose = False
+
         if not self.config.enabled:
             logger.info("프로파일러가 비활성화되었습니다")
             return
@@ -279,8 +289,10 @@ class SystemProfiler:
         # 함수 프로파일 저장소
         self.function_profiles: Dict[str, FunctionProfile] = {}
 
-        # 메모리 스냅샷 이력
+        # 메모리 스냅샷 이력 - 성능 모드에서는 더 적은 수 저장
+        history_size = 20 if self.config.lightweight_mode else 100
         self.memory_snapshots: List[MemorySnapshot] = []
+        self._max_snapshots = history_size
 
         # 프로파일 결과 저장 디렉토리 생성
         if self.config.log_to_file:
@@ -295,15 +307,20 @@ class SystemProfiler:
         self.torch_profiler_session = None
 
         # 로그 레벨에 따른 상세 로깅 설정
-        if self.config.verbose or get_config().logging.level.upper() == "DEBUG":  # DEBUG=10
-            logger.debug("상세 로깅이 활성화되었습니다")
+        if self.config.verbose or get_config().logging.level.upper() == "DEBUG":
+            if not self.config.lightweight_mode:  # 경량 모드에서는 상세 로깅 비활성화
+                logger.debug("상세 로깅이 활성화되었습니다")
 
-        logger.info(f"시스템 프로파일러가 초기화되었습니다 (간격: {self.config.profile_interval}초)",
-                    context={
-                        "profile_interval": self.config.profile_interval,
-                        "memory_profiling": self.config.memory_profiling,
-                        "torch_profiling": self.config.torch_profiling
-                    })
+        # 초기화 로깅 간소화 (성능 모드)
+        if self.config.lightweight_mode:
+            logger.info("시스템 프로파일러가 경량 모드로 초기화되었습니다")
+        else:
+            logger.info(f"시스템 프로파일러가 초기화되었습니다 (간격: {self.config.profile_interval}초)",
+                        context={
+                            "profile_interval": self.config.profile_interval,
+                            "memory_profiling": self.config.memory_profiling,
+                            "torch_profiling": self.config.torch_profiling
+                        })
 
     def start(self) -> None:
         """주기적 프로파일링 시작"""
@@ -339,6 +356,69 @@ class SystemProfiler:
             # 최종 프로파일 결과 저장
             self._save_profile_results()
 
+    def _perform_profiling_lightweight(self) -> None:
+        """경량 프로파일링 작업 수행 (성능 최적화)"""
+        # 메모리 스냅샷 생성 (최소 정보만)
+        if self.config.memory_profiling:
+            try:
+                memory_snapshot = self._capture_memory_snapshot_lightweight()
+                self.memory_snapshots.append(memory_snapshot)
+
+                # 최대 스냅샷 수 유지
+                if len(self.memory_snapshots) > self._max_snapshots:
+                    self.memory_snapshots.pop(0)
+            except Exception as err:
+                logger.warning(f"메모리 스냅샷 캡처 오류: {str(err)}")
+
+        # PyTorch 프로파일링 (필요한 경우에만)
+        if self.config.torch_profiling and PACKAGE_STATUS["torch_profiler"] and torch.cuda.is_available():
+            # GPU 사용률이 높은 경우에만 프로파일링 실행
+            try:
+                gpu_usage_high = False
+                for idx in range(torch.cuda.device_count()):
+                    mem_allocated = torch.cuda.memory_allocated(i) / torch.cuda.get_device_properties(idx).total_memory
+                    if mem_allocated > 0.7:  # 70% 이상 사용시
+                        gpu_usage_high = True
+                        break
+
+                if gpu_usage_high:
+                    self._profile_torch_operations()
+            except Exception:
+                pass  # 오류 무시
+
+        # 프로파일 결과 저장 (간격 감소 - 10번에 1번만)
+        if self.config.log_to_file and random.random() < 0.1:  # 10% 확률로 저장
+            self._save_profile_results()
+
+    def _capture_memory_snapshot_lightweight(self) -> MemorySnapshot:
+        """경량 메모리 스냅샷 캡처 (최소 정보만)"""
+        snapshot = MemorySnapshot()
+
+        # 시스템 RAM 정보만 수집
+        mem = psutil.virtual_memory()
+        snapshot.system_ram_used_gb = mem.used / (1024 ** 3)
+        snapshot.system_ram_total_gb = mem.total / (1024 ** 3)
+        snapshot.system_ram_percent = mem.percent
+
+        # 프로세스 메모리 정보 수집
+        pid = os.getpid()
+        process = psutil.Process(pid)
+        snapshot.process_ram_used_gb = process.memory_info().rss / (1024 ** 3)
+
+        # GPU 정보만 최소로 수집
+        if torch.cuda.is_available():
+            for idx in range(torch.cuda.device_count()):
+                # 간소화된 GPU 정보만 수집
+                gpu_info = GPUInfo(
+                    id=idx,
+                    name=torch.cuda.get_device_name(idx),
+                    memory_allocated_gb=torch.cuda.memory_allocated(idx) / (1024 ** 3),
+                    memory_reserved_gb=torch.cuda.memory_reserved(idx) / (1024 ** 3)
+                )
+                snapshot.gpu_memory.append(gpu_info)
+
+        return snapshot
+
     def _profiling_loop(self) -> None:
         """주기적 프로파일링 루프"""
         last_profile_time = time.time()
@@ -351,12 +431,17 @@ class SystemProfiler:
 
                 # 지정된 간격마다 프로파일링 수행
                 if current_time - last_profile_time >= self.config.profile_interval:
-                    with TimingContext(logger, f"프로파일링 실행 #{loop_count}"):
-                        self._perform_profiling()
+                    # 경량 모드에서는 로깅 없이 실행
+                    if self.config.lightweight_mode:
+                        self._perform_profiling_lightweight()
+                    else:
+                        with TimingContext(logger, f"프로파일링 실행 #{loop_count}"):
+                            self._perform_profiling()
                     last_profile_time = current_time
 
                 # 잠시 대기 (10% 간격으로 중지 이벤트 체크)
-                check_interval = min(1.0, self.config.profile_interval / 10)
+                check_interval = min(5.0 if self.config.lightweight_mode else 1.0,
+                                     self.config.profile_interval / 10)
                 time.sleep(check_interval)
 
             except Exception as err:
@@ -591,6 +676,29 @@ class SystemProfiler:
         if not self.config.enabled:
             return {"status": "profiler_disabled"}
 
+        # 성능 모드에서는 간소화된 보고서 생성
+        if self.config.lightweight_mode:
+            try:
+                # 최신 스냅샷 가져오기
+                current_snapshot = self.memory_snapshots[
+                    -1] if self.memory_snapshots else self._capture_memory_snapshot_lightweight()
+
+                # 간소화된 보고서
+                return {
+                    "timestamp": datetime.now().isoformat(),
+                    "ram_used_gb": current_snapshot.process_ram_used_gb,
+                    "ram_percent": current_snapshot.system_ram_percent,
+                    "gpu_memory": [
+                        {
+                            "id": gpu.id,
+                            "memory_allocated_gb": gpu.memory_allocated_gb
+                        } for gpu in current_snapshot.gpu_memory
+                    ] if current_snapshot.gpu_memory else []
+                }
+            except Exception as err:
+                logger.warning(f"간소화된 메모리 보고서 생성 오류: {str(err)}")
+                return {"status": "error", "error": str(err)}
+
         with TimingContext(memory_logger, "메모리 보고서 생성"):
             try:
                 # 최신 스냅샷 생성
@@ -630,6 +738,7 @@ class SystemProfiler:
                     "timestamp": datetime.now().isoformat()
                 }
 
+    @classmethod
     def _calculate_memory_changes(cls, current: MemorySnapshot, previous: MemorySnapshot) -> Dict[str, Any]:
         """두 스냅샷 간의 메모리 변화량 계산"""
         changes = {}
@@ -740,6 +849,47 @@ class SystemProfiler:
         """
         with TimingContext(logger, "시스템 상태 통계 수집"):
             try:
+                # 성능 모드에서는 중요 정보만 수집
+                if performance_mode:
+                    # CPU 정보 간소화
+                    cpu_percent = psutil.cpu_percent(interval=0.1)
+
+                    # 메모리 정보 간소화
+                    mem = psutil.virtual_memory()
+                    memory_stats = {
+                        "total_gb": mem.total / (1024 ** 3),
+                        "used_gb": mem.used / (1024 ** 3),
+                        "percent": mem.percent
+                    }
+
+                    # 프로세스 정보 간소화
+                    pid = os.getpid()
+                    process = psutil.Process(pid)
+                    process_stats = {
+                        "memory_gb": process.memory_info().rss / (1024 ** 3),
+                        "cpu_percent": process.cpu_percent(interval=0.1)
+                    }
+
+                    # 기본 통계 정보
+                    stats = {
+                        "timestamp": datetime.now().isoformat(),
+                        "cpu_percent": cpu_percent,
+                        "memory_percent": mem.percent,
+                        "process_memory_gb": process_stats["memory_gb"]
+                    }
+
+                    # GPU 정보 추가 (필요한 경우만)
+                    if torch.cuda.is_available():
+                        gpu_stats = []
+                        for idx in range(torch.cuda.device_count()):
+                            gpu_stats.append({
+                                "id": idx,
+                                "memory_allocated_gb": torch.cuda.memory_allocated(idx) / (1024 ** 3)
+                            })
+                        stats["gpu"] = gpu_stats
+
+                    return stats
+
                 # CPU 정보 수집
                 cpu_stats = cls._collect_cpu_stats()
 
@@ -939,7 +1089,8 @@ def get_profiler() -> SystemProfiler:
 
     # 모니터링이 비활성화된 경우 더미 프로파일러 반환
     if not config.monitoring.enabled:
-        logger.debug("모니터링이 비활성화되어 더미 프로파일러를 반환합니다")
+        if not performance_mode:
+            logger.debug("모니터링이 비활성화되어 더미 프로파일러를 반환합니다")
         return _get_dummy_profiler()
 
     if _active_profiler is None:
@@ -951,15 +1102,20 @@ def get_profiler() -> SystemProfiler:
             torch_profiling=torch.cuda.is_available(),
             log_to_file=True,
             profile_dir="./profiles",
-            verbose=config.logging.level.upper() == "DEBUG"
+            verbose=config.logging.level.upper() == "DEBUG",
+            # 성능 모드에서는 경량 모드 활성화
+            lightweight_mode = performance_mode
         )
 
-        logger.info("시스템 프로파일러 초기화",
-                    context={
-                        "profile_interval": local_profiler_config.profile_interval,
-                        "memory_profiling": local_profiler_config.memory_profiling,
-                        "torch_profiling": local_profiler_config.torch_profiling
-                    })
+        if performance_mode:
+            logger.info("시스템 프로파일러 초기화 (경량 모드)")
+        else:
+            logger.info("시스템 프로파일러 초기화",
+                        context={
+                            "profile_interval": local_profiler_config.profile_interval,
+                            "memory_profiling": local_profiler_config.memory_profiling,
+                            "torch_profiling": local_profiler_config.torch_profiling
+                        })
 
         _active_profiler = SystemProfiler(local_profiler_config)
         _active_profiler.start()
@@ -1013,9 +1169,20 @@ def profile(func_):
     if not config.monitoring.enabled:
         return func_
 
+    # 성능 모드에서는 중요 함수만 프로파일링
+    if performance_mode:
+        # 중요 함수 패턴 (generate, stream 등)
+        important_patterns = ['generate', 'stream', 'init', 'shutdown']
+        is_important = any(pattern in func_.__name__ for pattern in important_patterns)
+
+        # 중요하지 않은 함수는 프로파일링 없이 반환
+        if not is_important:
+            return func_
+
     # 함수명 및 모듈 로깅
-    function_logger.debug(f"함수 '{func_.__name__}' 프로파일링 데코레이터 적용됨",
-                          context={"module": func_.__module__})
+    if not performance_mode:
+        function_logger.debug(f"함수 '{func_.__name__}' 프로파일링 데코레이터 적용됨",
+                              context={"module": func_.__module__})
 
     return get_profiler().profile_function(func_)
 
@@ -1029,6 +1196,16 @@ def profile_block(name: str):
     Args:
         name: 프로파일링 블록 이름
     """
+    # 성능 모드이면서 특별히 중요하지 않은 블록은 프로파일링 생략
+    if performance_mode:
+        # 중요 블록 패턴
+        important_patterns = ['generate', 'stream', 'engine_init', 'request']
+        is_important = any(pattern in name for pattern in important_patterns)
+
+        if not is_important:
+            yield
+            return
+
     # 모니터링이 비활성화된 경우 빈 컨텍스트 반환
     if not config.monitoring.enabled:
         yield
@@ -1039,9 +1216,11 @@ def profile_block(name: str):
         yield
         return
 
-    function_logger.debug(f"블록 '{name}' 프로파일링 시작")
+    # 성능 모드에서는 로깅 생략
+    if not performance_mode:
+        function_logger.debug(f"블록 '{name}' 프로파일링 시작")
 
-    # TimingContext를 사용하면 코드가 더 깔끔해짐
+    # TimingContext를 사용
     with TimingContext(None, f"Block {name}") as timing:
         try:
             yield
@@ -1056,8 +1235,10 @@ def profile_block(name: str):
 
             profiler_.function_profiles[key].update(timing.duration)
 
-            function_logger.debug(f"블록 '{name}' 프로파일링 완료",
-                                  context={"duration": f"{timing.duration:.6f}s"})
+            # 성능 모드에서는 특별히 느린 블록만 로깅 (>100ms)
+            if not performance_mode or timing.duration > 0.1:
+                function_logger.debug(f"블록 '{name}' 프로파일링 완료",
+                                      context={"duration": f"{timing.duration:.6f}s"})
 
 
 # API 엔드포인트용 함수
@@ -1068,10 +1249,15 @@ async def get_profiler_memory_report() -> Dict[str, Any]:
     Returns:
         현재 메모리 사용 보고서
     """
-    memory_logger.info("API: 메모리 보고서 요청됨")
+    if not performance_mode:
+        memory_logger.info("API: 메모리 보고서 요청됨")
+
     profiler_ = get_profiler()
     report = await profiler_.get_memory_report()
-    memory_logger.debug("API: 메모리 보고서 반환 완료")
+
+    if not performance_mode:
+        memory_logger.debug("API: 메모리 보고서 반환 완료")
+
     return report
 
 
@@ -1082,10 +1268,15 @@ async def get_profiler_function_stats() -> Dict[str, Any]:
     Returns:
         함수 실행 시간 통계
     """
-    function_logger.info("API: 함수 통계 요청됨")
+    if not performance_mode:
+        function_logger.info("API: 함수 통계 요청됨")
+
     profiler_ = get_profiler()
     stats = await profiler_.get_function_stats()
-    function_logger.debug("API: 함수 통계 반환 완료")
+
+    if not performance_mode:
+        function_logger.debug("API: 함수 통계 반환 완료")
+
     return stats
 
 
@@ -1096,9 +1287,14 @@ async def get_profiler_system_stats() -> Dict[str, Any]:
     Returns:
         시스템 상태 보고서
     """
-    logger.info("API: 시스템 상태 통계 요청됨")
+    if not performance_mode:
+        logger.info("API: 시스템 상태 통계 요청됨")
+
     stats = await SystemProfiler.get_system_stats()
-    logger.debug("API: 시스템 상태 통계 반환 완료")
+
+    if not performance_mode:
+        logger.debug("API: 시스템 상태 통계 반환 완료")
+
     return stats
 
 
@@ -1114,14 +1310,23 @@ def init_profiling():
     """
     if config.monitoring.enabled:
         try:
-            logger.info("프로파일링 시스템 초기화 중")
+            if performance_mode:
+                logger.info("프로파일링 시스템 초기화 중")
+            else:
+                logger.info("프로파일링 시스템 초기화 중",
+                            context={"performance_mode": performance_mode})
+
             profiler_ = get_profiler()
-            logger.info("프로파일링 시스템이 초기화되었습니다",
-                        context={
-                            "profile_interval": profiler_.config.profile_interval,
-                            "memory_profiling": profiler_.config.memory_profiling,
-                            "torch_profiling": profiler_.config.torch_profiling
-                        })
+
+            if performance_mode:
+                logger.info("프로파일링 시스템이 초기화되었습니다")
+            else:
+                logger.info("프로파일링 시스템이 초기화되었습니다",
+                            context={
+                                "profile_interval": profiler_.config.profile_interval,
+                                "memory_profiling": profiler_.config.memory_profiling,
+                                "torch_profiling": profiler_.config.torch_profiling
+                            })
             return profiler_
         except Exception as err:
             logger.error(f"프로파일링 초기화 실패: {str(err)}",

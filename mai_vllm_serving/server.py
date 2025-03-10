@@ -11,7 +11,7 @@ import time
 import uuid
 import warnings
 from contextlib import asynccontextmanager
-from typing import List, Optional, Union, Dict, Any
+from typing import List, Optional, Union, Dict, Any, TypedDict
 
 import torch
 import uvicorn
@@ -55,17 +55,25 @@ os.environ["OMP_NUM_THREADS"] = "4"
 # 설정 객체 가져오기
 config = get_config()
 
+# 로깅 성능 모드 설정 (환경 설정에 따라)
+is_log_performance_mode = config.logging.log_performance_mode
+if is_log_performance_mode:
+    print("Enabling logging performance mode for environment")
+
 # 로깅 초기화
 root_logger = setup_logging(
     service_name="mai-vllm-serving",
     log_level=config.logging.level,
     use_json=config.logging.json,
     log_file=config.logging.file,
-    include_caller_info=True
+    include_caller_info=True,
+    performance_mode=config.logging.log_performance_mode,
+    async_logging=True,
+    sampling_rate=config.logging.log_sampling_rate
 )
 
 # 구조화된 로거 가져오기
-logger = get_logger("server")
+logger = get_logger("server", production_mode=is_log_performance_mode)
 
 # API 요청/응답 로거 생성
 request_logger = get_request_logger()
@@ -131,6 +139,18 @@ class GenerationRequest(BaseModel):
         return self
 
 
+class CudaInfo(TypedDict, total=False):
+    available: bool
+    device_count: int
+    current_device: int
+    current_device_name: str
+
+
+class SystemInfo(TypedDict, total=False):
+    cuda: CudaInfo
+    memory: Dict[str, Any]
+
+
 # 요청 추적 의존성
 async def get_request_tracking(request: Request) -> Dict[str, Any]:
     """
@@ -169,6 +189,11 @@ async def lifespan(app_: FastAPI):
         app_: FastAPI 애플리케이션
     """
     try:
+        # 로깅 필터 적용 (성능 최적화)
+        logging_filter = ConditionalFilter()
+        app_root_logger = logging.getLogger()
+        app_root_logger.addFilter(logging_filter)
+
         # vLLM 관련 로거의 레벨을 WARNING으로 설정
         logging.getLogger("vllm").setLevel(logging.WARNING)
         logging.getLogger("vllm.engine").setLevel(logging.WARNING)
@@ -375,21 +400,38 @@ app.add_middleware(
 @app.middleware("http")
 async def add_utf8_header(request: Request, call_next):
     """UTF-8 인코딩 헤더 추가 미들웨어"""
+    # 성능 모드 감지
+    performance_mode = config.logging.log_performance_mode
+
     # 요청 로깅 확장
     req_method = request.method
     req_url = str(request.url)
     client_info = f"{request.client.host}:{request.client.port}" if request.client else "unknown"
 
-    # DEBUG 레벨에서 모든 요청 로깅
-    logger.debug(f"HTTP Request: {req_method} {req_url}",
-                 context={
-                     "http": {
-                         "method": req_method,
-                         "url": req_url,
-                         "client": client_info,
-                         "user_agent": request.headers.get("user-agent", "unknown")
-                     }
-                 })
+    # 성능 모드 여부에 따라 로깅 수준 조정
+    if performance_mode:
+        # 성능 모드에서는 INFO 이상의 엔드포인트만 로깅
+        should_log = req_url.endswith(("/generate", "/health", "/metrics"))
+        if should_log:
+            logger.debug(f"HTTP Request: {req_method} {req_url}",
+                         context={
+                             "http": {
+                                 "method": req_method,
+                                 "url": req_url,
+                                 "client": client_info
+                             }
+                         })
+    else:
+        # DEBUG 레벨에서 모든 요청 로깅
+        logger.debug(f"HTTP Request: {req_method} {req_url}",
+                     context={
+                         "http": {
+                             "method": req_method,
+                             "url": req_url,
+                             "client": client_info,
+                             "user_agent": request.headers.get("user-agent", "unknown")
+                         }
+                     })
 
     # 요청 처리 및 응답 시간 측정
     start_time = time.time()
@@ -406,27 +448,42 @@ async def add_utf8_header(request: Request, call_next):
     response.headers["X-Process-Time"] = str(process_time)
 
     # 처리 완료된 요청 로깅 (200 응답은 DEBUG, 에러는 INFO 이상으로 로깅)
-    if 200 <= response.status_code < 400:
-        logger.debug(f"HTTP Response: {response.status_code} in {process_time:.3f}s",
-                     context={
-                         "http": {
-                             "method": req_method,
-                             "url": req_url,
-                             "status_code": response.status_code,
-                             "process_time": process_time
-                         }
-                     })
+    if performance_mode:
+        # 성능 모드: 오류 응답 또는 느린 응답(500ms 이상)만 INFO 로깅
+        if response.status_code >= 400 or process_time > 0.5:
+            logger.info(f"HTTP Response: {response.status_code} in {process_time:.3f}s",
+                        context={
+                            "http": {
+                                "method": req_method,
+                                "url": req_url,
+                                "status_code": response.status_code,
+                                "process_time": process_time,
+                                "client": client_info
+                            }
+                        })
     else:
-        logger.info(f"HTTP Error Response: {response.status_code} in {process_time:.3f}s",
-                    context={
-                        "http": {
-                            "method": req_method,
-                            "url": req_url,
-                            "status_code": response.status_code,
-                            "process_time": process_time,
-                            "client": client_info
-                        }
-                    })
+        # 개발 모드: 일반 응답은 DEBUG, 오류는 INFO로 로깅
+        if 200 <= response.status_code < 400:
+            logger.debug(f"HTTP Response: {response.status_code} in {process_time:.3f}s",
+                         context={
+                             "http": {
+                                 "method": req_method,
+                                 "url": req_url,
+                                 "status_code": response.status_code,
+                                 "process_time": process_time
+                             }
+                         })
+        else:
+            logger.info(f"HTTP Error Response: {response.status_code} in {process_time:.3f}s",
+                        context={
+                            "http": {
+                                "method": req_method,
+                                "url": req_url,
+                                "status_code": response.status_code,
+                                "process_time": process_time,
+                                "client": client_info
+                            }
+                        })
 
     return response
 
@@ -520,6 +577,9 @@ async def generate(
     Returns:
         생성된 텍스트와 관련 메타데이터
     """
+    # 성능 모드 감지
+    performance_mode = config.logging.log_performance_mode
+
     # 요청 ID 생성 및 로깅
     request_id = request.request_id if request.request_id else tracking["request_id"]
     client_ip = client_request.client.host if client_request.client else "unknown"
@@ -531,19 +591,30 @@ async def generate(
     # 요청 컨텍스트 설정
     logger.set_request_id(request_id)
 
-    # 상세한 요청 로깅
-    logger.info(f"Generation request received: {request_id}",
-                context={
-                    "request": {
-                        "id": request_id,
-                        "prompt_length": len(request.prompt),
-                        "max_tokens": request.max_tokens,
-                        "temperature": request.temperature,
-                        "client_ip": client_ip,
-                        "user_agent": client_request.headers.get("user-agent", "unknown"),
-                        "stream": request.stream
-                    }
-                })
+    # 로깅 최적화: 성능 모드에서는 간결한 로깅
+    if performance_mode:
+        logger.info(f"Generation request received: {request_id}",
+                    context={
+                        "request": {
+                            "id": request_id,
+                            "prompt_length": len(request.prompt),
+                            "stream": request.stream
+                        }
+                    })
+    else:
+        # 상세한 요청 로깅
+        logger.info(f"Generation request received: {request_id}",
+                    context={
+                        "request": {
+                            "id": request_id,
+                            "prompt_length": len(request.prompt),
+                            "max_tokens": request.max_tokens,
+                            "temperature": request.temperature,
+                            "client_ip": client_ip,
+                            "user_agent": client_request.headers.get("user-agent", "unknown"),
+                            "stream": request.stream
+                        }
+                    })
 
     # 요청 로깅 - 요청 데이터 마스킹이 정책적으로 필요한 경우 이 함수가 처리
     request_logger.log_request(
@@ -553,7 +624,8 @@ async def generate(
     )
 
     # 타이밍 컨텍스트 시작
-    timing = TimingContext(logger, f"Request {request_id} processing")
+    timing = TimingContext(logger, f"Request {request_id} processing",
+                           log_threshold=0.1 if performance_mode else None)
 
     try:
         with timing:
@@ -748,7 +820,7 @@ async def health():
         is_distributed = isinstance(llm_engine, DistributedVLLMEngine)
 
         # 시스템 리소스 정보 추가
-        system_info = {}
+        system_info: SystemInfo = {}
         if torch.cuda.is_available():
             system_info["cuda"] = {
                 "available": True,
@@ -851,21 +923,33 @@ async def global_exception_handler(request: Request, exc: Exception):
     Returns:
         적절한 오류 응답
     """
+    # 성능 모드 감지
+    performance_mode = config.logging.log_performance_mode
+
     # 요청 정보 수집
     request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
     client_ip = request.client.host if request.client else "unknown"
 
-    # 오류 컨텍스트
-    error_context = {
-        "error": {
-            "type": type(exc).__name__,
-            "message": str(exc),
-            "request_id": request_id,
-            "path": request.url.path,
-            "method": request.method,
-            "client_ip": client_ip
+    # 오류 컨텍스트 구성 (성능 모드에서는 경량화)
+    if performance_mode:
+        error_context = {
+            "error": {
+                "type": type(exc).__name__,
+                "message": str(exc),
+                "request_id": request_id
+            }
         }
-    }
+    else:
+        error_context = {
+            "error": {
+                "type": type(exc).__name__,
+                "message": str(exc),
+                "request_id": request_id,
+                "path": request.url.path,
+                "method": request.method,
+                "client_ip": client_ip
+            }
+        }
 
     # HTTPException은 일반적인 오류이므로 INFO 레벨로 로깅
     if isinstance(exc, HTTPException):

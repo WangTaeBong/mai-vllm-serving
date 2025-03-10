@@ -4,12 +4,14 @@ mai-vllm-serving 향상된 구조화 로깅 유틸리티
 """
 
 import asyncio
+import collections
 import gzip
 import json
 import logging
 import os
+import queue
+import random
 import shutil
-import sys
 import threading
 import time
 import traceback
@@ -23,6 +25,32 @@ from typing import Optional, Dict, Any, Callable, List
 from mai_vllm_serving.utils.config import get_config
 
 
+def _init_performance_mode():
+    """성능 모드 초기화"""
+    # 환경 변수 검사
+    perf_mode = os.environ.get("LOG_PERFORMANCE_MODE", "").lower() in ("1", "true", "yes")
+
+    # 설정에서 프로덕션 모드 여부 확인 (환경 변수가 없을 경우)
+    if not perf_mode:
+        try:
+            env = os.environ.get("ENV", "").lower()
+            perf_mode = env in ("production", "prod")
+            if perf_mode:
+                os.environ["LOG_PERFORMANCE_MODE"] = "1"
+        except Exception:
+            pass
+
+    # 샘플링 비율 설정
+    if perf_mode and "LOG_SAMPLING_RATE" not in os.environ:
+        os.environ["LOG_SAMPLING_RATE"] = "0.1"  # 기본 10% 샘플링
+
+    return perf_mode
+
+
+# 모듈 초기화 시 실행
+PERFORMANCE_MODE = _init_performance_mode()
+
+
 # 로그 디렉토리 생성 함수
 def ensure_log_directory(log_path: str) -> None:
     """
@@ -34,6 +62,113 @@ def ensure_log_directory(log_path: str) -> None:
     log_dir = os.path.dirname(log_path)
     if log_dir and not os.path.exists(log_dir):
         os.makedirs(log_dir, exist_ok=True)
+
+
+class AsyncLogHandler(logging.Handler):
+    """
+    비동기 로그 핸들러
+
+    로그 레코드를 큐에 넣고 백그라운드 스레드에서 처리
+    """
+
+    def __init__(self, target_handler, queue_size=1000, batch_size=100, flush_interval=0.5):
+        """
+        비동기 로그 핸들러 초기화
+
+        Args:
+            target_handler: 실제 로그를 처리할 핸들러
+            queue_size: 로그 큐 최대 크기
+            batch_size: 한 번에 처리할 최대 로그 레코드 수
+            flush_interval: 로그 플러시 간격 (초)
+        """
+        super().__init__()
+        self.target_handler = target_handler
+        self.queue = queue.Queue(maxsize=queue_size)
+        self.batch_size = batch_size
+        self.flush_interval = flush_interval
+        self.worker_thread = None
+        self.stop_event = threading.Event()
+        self._start_worker()
+
+    def _start_worker(self):
+        """백그라운드 워커 스레드 시작"""
+        self.stop_event.clear()
+        self.worker_thread = threading.Thread(
+            target=self._process_logs,
+            daemon=True,
+            name="AsyncLogWorker"
+        )
+        self.worker_thread.start()
+
+    def _process_logs(self):
+        """로그 처리 워커 스레드 함수"""
+        while not self.stop_event.is_set():
+            try:
+                # 배치 처리를 위한 레코드 모음
+                records = []
+
+                # 배치 크기만큼 레코드 수집 또는 타임아웃까지 대기
+                try:
+                    # 첫 번째 레코드는 블로킹으로 가져옴
+                    records.append(self.queue.get(block=True, timeout=self.flush_interval))
+
+                    # 나머지 레코드는 큐가 비거나 배치 크기에 도달할 때까지 비블로킹으로 가져옴
+                    while len(records) < self.batch_size:
+                        records.append(self.queue.get(block=False))
+                except queue.Empty:
+                    # 타임아웃이나 큐가 비었을 때 - 지금까지 수집한 레코드만 처리
+                    pass
+
+                # 수집된 레코드 처리
+                if records:
+                    for record in records:
+                        try:
+                            self.target_handler.handle(record)
+                        except Exception:
+                            # 로그 처리 중 오류가 발생해도 워커 스레드는 계속 실행
+                            sys.stderr.write(f"Error processing log record in AsyncLogHandler\n")
+                        finally:
+                            self.queue.task_done()
+
+            except Exception:
+                # 예기치 않은 오류가 발생해도 워커 스레드는 계속 실행
+                sys.stderr.write(f"Unexpected error in AsyncLogHandler worker\n")
+                time.sleep(1.0)  # 오류 발생 시 잠시 대기
+
+    def emit(self, record):
+        """
+        로그 레코드 큐에 추가
+
+        Args:
+            record: 로그 레코드
+        """
+        try:
+            # 로그 레코드를 큐에 넣기 (꽉 찬 경우 비블로킹으로 처리하고 경고)
+            try:
+                self.queue.put(record, block=False)
+            except queue.Full:
+                sys.stderr.write(f"AsyncLogHandler queue is full. Discarding log record: {record.getMessage()}\n")
+        except Exception:
+            self.handleError(record)
+
+    def close(self):
+        """핸들러 정리"""
+        self.stop_event.set()
+        if self.worker_thread and self.worker_thread.is_alive():
+            self.worker_thread.join(timeout=2.0)
+
+        # 남은 로그 레코드 처리
+        try:
+            while not self.queue.empty():
+                record = self.queue.get(block=False)
+                self.target_handler.handle(record)
+                self.queue.task_done()
+        except Exception:
+            pass
+
+        # 대상 핸들러 정리
+        self.target_handler.close()
+        super().close()
 
 
 # 로그 회전 정책 클래스
@@ -687,20 +822,28 @@ class RequestResponseLogger:
 
 # 컨텍스트 관리자를 통한 요청 처리 시간 측정
 class TimingContext:
-    """요청 처리 시간 측정을 위한 컨텍스트 관리자"""
+    """요청 처리 시간 측정을 위한 컨텍스트 관리자 (성능 최적화 버전)"""
 
-    def __init__(self, logger: Optional[logging.Logger] = None, label: str = "Operation"):
+    __slots__ = ('logger', 'label', 'start_time', 'end_time', 'log_threshold', 'production_mode')
+
+    def __init__(self, logger: Optional[logging.Logger, 'StructuredLogger', 'OptimizedStructuredLogger'] = None,
+                 label: str = "Operation",
+                 log_threshold: Optional[float] = None):
         """
         타이밍 컨텍스트 초기화
 
         Args:
             logger: 로거 인스턴스 (None인 경우 로깅하지 않음)
             label: 작업 레이블
+            log_threshold: 로깅 임계값 (초) - 지정된 시간보다 오래 걸리는 작업만 로깅
         """
         self.logger = logger
         self.label = label
         self.start_time = None
         self.end_time = None
+        self.log_threshold = log_threshold
+        # 환경 변수를 통한 성능 모드 감지
+        self.production_mode = get_config().logging.log_performance_mode
 
     def __enter__(self):
         """컨텍스트 시작 시 시간 기록"""
@@ -712,10 +855,15 @@ class TimingContext:
         self.end_time = time.time()
         duration = self.end_time - self.start_time
 
-        if self.logger:
-            self.logger.info(f"{self.label} completed in {duration:.3f} seconds")
+        # 로거가 있고, 임계값 조건을 만족하는 경우에만 로깅
+        if self.logger and (self.log_threshold is None or duration >= self.log_threshold):
+            # 성능 모드에서는 느린 작업(500ms 이상)만 INFO 수준으로 로깅
+            if self.production_mode and duration < 0.5:
+                self.logger.debug(f"{self.label} completed in {duration:.3f} seconds")
+            else:
+                self.logger.info(f"{self.label} completed in {duration:.3f} seconds")
 
-        return False  # 예외를 전파함
+        return False  # 예외를 전파
 
     @property
     def duration(self):
@@ -899,9 +1047,410 @@ class StructuredLogger:
                   })
 
 
+class LogSamplingFilter(logging.Filter):
+    """
+    로그 샘플링 필터
+
+    설정된 비율에 따라 로그 레코드를 필터링
+    """
+
+    def __init__(self, sampling_rate=0.1):
+        """
+        로그 샘플링 필터 초기화
+
+        Args:
+            sampling_rate: 로깅할 레코드 비율 (0.0~1.0)
+        """
+        super().__init__()
+        self.sampling_rate = sampling_rate
+        # 요청 ID별 결정을 저장하여 동일 요청은 일관되게 처리
+        self.decisions = {}
+        self.max_decisions = 10000  # 메모리 누수 방지용 최대 결정 수
+
+    def filter(self, record):
+        """
+        로그 레코드 필터링
+
+        Args:
+            record: 로그 레코드
+
+        Returns:
+            True이면 로그 기록, False면 필터링
+        """
+        # 오류 로그는 항상 기록
+        if record.levelno >= logging.WARNING:
+            return True
+
+        # 요청 ID 추출
+        request_id = getattr(record, 'request_id', None)
+        if request_id is None:
+            # 컨텍스트에서 요청 ID 찾기
+            context = getattr(record, 'context', {})
+            request_id = context.get('request_id', None)
+
+        # 요청 ID가 있으면 해당 요청에 대한 샘플링 결정 재사용
+        if request_id:
+            if request_id in self.decisions:
+                return self.decisions[request_id]
+
+            # 새 결정 및 저장
+            decision = random.random() < self.sampling_rate
+            self.decisions[request_id] = decision
+
+            # 메모리 관리: 최대 결정 수 초과 시 오래된 것부터 삭제
+            if len(self.decisions) > self.max_decisions:
+                # 무작위로 절반 삭제
+                keys_to_remove = random.sample(list(self.decisions.keys()),
+                                               len(self.decisions) // 2)
+                for key in keys_to_remove:
+                    del self.decisions[key]
+
+            return decision
+
+        # 요청 ID가 없는 경우 샘플링 비율에 따라 결정
+        return random.random() < self.sampling_rate
+
+
+class OptimizedStructuredLogger(StructuredLogger):
+    """
+    성능 최적화된 구조화 로거
+    """
+
+    def __init__(self, logger, production_mode=False):
+        """
+        최적화된 구조화 로거 초기화
+
+        Args:
+            logger: 기본 로거 인스턴스
+            production_mode: 프로덕션 모드 활성화 여부 (경량화된 로깅)
+        """
+        super().__init__(logger)
+        self.production_mode = production_mode
+        self._context_hash = None  # 컨텍스트 캐싱을 위한 해시
+        self._cached_context = {}  # 캐시된 컨텍스트
+
+    def _get_context(self):
+        """
+        현재 컨텍스트 가져오기 (캐싱 적용)
+
+        Returns:
+            현재 로깅 컨텍스트
+        """
+        if not hasattr(self.thread_local, 'context'):
+            self.thread_local.context = {}
+
+        # 컨텍스트 해시 계산
+        current_hash = hash(frozenset(self.thread_local.context.items()))
+
+        # 컨텍스트가 변경된 경우에만 새로 생성
+        if self._context_hash != current_hash:
+            self._context_hash = current_hash
+            self._cached_context = self.thread_local.context.copy()
+
+            # 요청 ID 추가
+            request_id = getattr(self.thread_local, 'request_id', None)
+            if request_id:
+                self._cached_context['request_id'] = request_id
+
+        return self._cached_context
+
+    def _log(self, level, msg, *args, **kwargs):
+        """
+        내부 로깅 메서드 (최적화된 버전)
+        """
+        # 로그 레벨 필터링 - 프로덕션 모드에서는 불필요한 로깅 스킵
+        if self.production_mode and level < logging.INFO:
+            # DEBUG 레벨은 프로덕션에서 스킵 (오버헤드 없이 빠르게 반환)
+            return
+
+        # extra 인자 처리
+        extra = kwargs.pop('extra', {})
+
+        # 프로덕션 모드에서는 경량화된 컨텍스트 적용
+        if self.production_mode:
+            # 필수 필드만 포함
+            context = {'request_id': getattr(self.thread_local, 'request_id', None)}
+
+            # kwargs에서 context 키워드가 있으면 중요 정보만 선택적으로 추가
+            if 'context' in kwargs:
+                user_context = kwargs.pop('context')
+                # 중요 필드만 복사 (에러 정보, 성능 지표 등)
+                for key in ['error', 'performance', 'status']:
+                    if key in user_context:
+                        context[key] = user_context[key]
+        else:
+            # 개발 모드에서는 전체 컨텍스트 사용
+            context = self._get_context()
+
+            # kwargs에서 context 키워드가 있으면 기존 컨텍스트와 병합
+            if 'context' in kwargs:
+                context.update(kwargs.pop('context'))
+
+        # extra에 컨텍스트 정보 추가
+        extra['context'] = context
+
+        # 원래 로거에 전달
+        self.logger.log(level, msg, *args, extra=extra, **kwargs)
+
+
+class OptimizedJsonFormatter(JsonFormatter):
+    """최적화된 JSON 포맷터"""
+
+    def __init__(self, service_name="mai-vllm-serving", include_caller_info=True,
+                 lightweight=False, cache_size=1000):
+        """
+        최적화된 JSON 포맷터 초기화
+
+        Args:
+            service_name: 서비스 이름
+            include_caller_info: 호출자 정보 포함 여부
+            lightweight: 경량 모드 여부 (필수 필드만 포함)
+            cache_size: 문자열 캐시 크기
+        """
+        super().__init__(service_name, include_caller_info)
+        self.lightweight = lightweight
+
+        # 자주 사용되는 필드 문자열 캐싱
+        self.field_cache = {
+            "timestamp": '"timestamp":"',
+            "service": '"service":"',
+            "level": '"level":"',
+            "logger": '"logger":"',
+            "message": '"message":"',
+            "thread": '"thread":"',
+            "process": '"process":',
+            "location": '"location":',
+            "context": '"context":',
+            "exception": '"exception":'
+        }
+
+        # 메시지 캐싱
+        self.message_cache = collections.OrderedDict()
+        self.cache_size = cache_size
+
+    def format(self, record):
+        """
+        로그 레코드를 JSON 형식으로 포맷팅 (최적화된 버전)
+        """
+        # 메시지 캐싱 적용
+        message = record.getMessage()
+        if message in self.message_cache:
+            # 캐시된 메시지 반환에도 시간 정보는 업데이트
+            log_data = json.loads(self.message_cache[message])
+            log_data["timestamp"] = datetime.fromtimestamp(record.created).isoformat()
+
+            # 컨텍스트 정보가 있으면 업데이트
+            if hasattr(record, "context") and record.context:
+                log_data["context"] = record.context
+
+            # LRU 캐시 업데이트
+            self.message_cache.pop(message)
+            self.message_cache[message] = json.dumps(log_data, ensure_ascii=False)
+            return self.message_cache[message]
+
+        # 경량 모드에서는 필수 필드만 포함
+        if self.lightweight:
+            log_data = {
+                "timestamp": datetime.fromtimestamp(record.created).isoformat(),
+                "service": self.service_name,
+                "level": record.levelname,
+                "message": message
+            }
+
+            # 요청 ID 추가 (컨텍스트에서)
+            if hasattr(record, "context") and record.context:
+                context = record.context
+                if "request_id" in context:
+                    log_data["request_id"] = context["request_id"]
+
+                # 오류 정보 추가
+                if "error" in context:
+                    log_data["error"] = context["error"]
+
+                # 성능 지표 추가
+                if "performance" in context:
+                    log_data["performance"] = context["performance"]
+        else:
+            # 전체 모드에서는 기존 방식과 동일하게 모든 필드 포함
+            log_data = {
+                "timestamp": datetime.fromtimestamp(record.created).isoformat(),
+                "service": self.service_name,
+                "level": record.levelname,
+                "logger": record.name,
+                "message": message,
+                "thread": record.threadName,
+                "process": record.process
+            }
+
+            # 호출자 정보 추가 (선택적)
+            if self.include_caller_info:
+                log_data["location"] = {
+                    "file": record.pathname,
+                    "line": record.lineno,
+                    "function": record.funcName
+                }
+
+            # 예외 정보 추가
+            if record.exc_info:
+                log_data["exception"] = {
+                    "type": record.exc_info[0].__name__,
+                    "message": str(record.exc_info[1]),
+                    "traceback": traceback.format_exception(*record.exc_info)
+                }
+
+            # 컨텍스트 정보 추가
+            if hasattr(record, "context") and record.context:
+                log_data["context"] = record.context
+
+        # 메시지 캐싱 (LRU 방식)
+        result = json.dumps(log_data, ensure_ascii=False)
+        self.message_cache[message] = result
+
+        # 캐시 크기 제한
+        if len(self.message_cache) > self.cache_size:
+            self.message_cache.popitem(last=False)  # 가장 오래된 항목 제거
+
+        return result
+
+
+class OptimizedRotatingFileHandler(AdvancedRotatingFileHandler):
+    """
+    성능 최적화된 로그 회전 파일 핸들러
+    """
+
+    def __init__(self, filename, when='midnight', interval=1, backup_count=30,
+                 encoding='utf-8', max_size_mb=100, compression=True):
+        """
+        최적화된 로그 회전 핸들러 초기화
+        """
+        super().__init__(
+            filename, when, interval, backup_count,
+            encoding=encoding, max_size_mb=max_size_mb, compression=compression
+        )
+        self._last_size_check = 0  # 마지막 크기 확인 시간
+        self._size_check_interval = 60  # 크기 확인 간격 (초)
+        self._rotation_lock = threading.RLock()  # 회전 잠금
+
+    def emit(self, record):
+        """
+        로그 레코드 출력 및 크기 기반 회전 처리 (최적화 버전)
+        """
+        try:
+            # 파일이 없는 경우 생성
+            if self.stream is None:
+                self.stream = self._open()
+
+            # 주기적으로만 크기 확인 (매 로그마다 확인하지 않음)
+            current_time = time.time()
+            if current_time - self._last_size_check >= self._size_check_interval:
+                self._last_size_check = current_time
+
+                # 스트림이 있는 경우만 크기 확인
+                if self.stream is not None:
+                    with self._rotation_lock:
+                        # 현재 파일 크기 확인
+                        self.stream.seek(0, 2)  # 파일의 끝으로 이동
+                        current_size = self.stream.tell()
+
+                        # 크기 제한 초과 시 회전
+                        if current_size >= self.max_size_bytes:
+                            if self.stream is not None:
+                                self.stream.close()
+                            self.stream = None  # type: ignore
+
+                            # 비동기로 회전 수행
+                            threading.Thread(
+                                target=self._do_rotation_async,
+                                args=(current_time,),
+                                daemon=True
+                            ).start()
+
+                            # 새 파일 열기
+                            if self.stream is None:
+                                self.stream = self._open()
+
+            # 로그 레코드 처리
+            msg = self.format(record)
+            stream = self.stream
+            stream.write(msg + self.terminator)
+            self.flush()
+
+        except Exception as e:
+            self.handleError(record)
+
+    def _do_rotation_async(self, timestamp):
+        """
+        비동기 로그 파일 회전 수행
+        """
+        with self._rotation_lock:
+            try:
+                # 현재 시간 기반 접미사 생성
+                current_time = datetime.fromtimestamp(timestamp).strftime("%Y%m%d_%H%M%S")
+
+                # 파일 이름과 확장자 분리
+                base_filename, ext = os.path.splitext(self.baseFilename)
+                new_filename = f"{base_filename}_{current_time}{ext}"
+
+                # 이미 존재하는 경우 처리
+                if os.path.exists(new_filename):
+                    i = 1
+                    while os.path.exists(f"{base_filename}_{current_time}_{i}{ext}"):
+                        i += 1
+                    new_filename = f"{base_filename}_{current_time}_{i}{ext}"
+
+                # 복사 방식으로 회전 (메인 로깅에 영향 최소화)
+                try:
+                    shutil.copy2(self.baseFilename, new_filename)
+                    # 복사 후 원본 파일 비우기
+                    with open(self.baseFilename, 'w') as f:
+                        f.truncate(0)
+                except Exception as e:
+                    sys.stderr.write(f"Error during log rotation: {str(e)}\n")
+
+                # 백업 파일 개수 유지와 압축을 별도 스레드에서 처리
+                threading.Thread(
+                    target=self._process_old_logs,
+                    args=(new_filename,),
+                    daemon=True
+                ).start()
+
+            except Exception as e:
+                sys.stderr.write(f"Error in async log rotation: {str(e)}\n")
+
+    def _process_old_logs(self, rotated_file):
+        """
+        이전 로그 파일 처리 (압축 및 정리)
+        """
+        try:
+            # 백업 파일 개수 유지
+            self._do_backup_count_maintenance()
+
+            # 압축 필요한 경우
+            if self.compression and rotated_file.endswith('.log'):
+                # 생성된 지 5분 이상 지난 파일만 압축
+                if time.time() - os.path.getctime(rotated_file) >= 300:
+                    # 압축된 파일 경로
+                    gz_path = rotated_file + '.gz'
+
+                    with open(rotated_file, 'rb') as f_in:
+                        with gzip.open(gz_path, 'wb') as f_out:
+                            chunk_size = 1024 * 1024  # 1MB 단위로 처리
+                            while True:
+                                chunk = f_in.read(chunk_size)
+                                if not chunk:
+                                    break
+                                f_out.write(chunk)
+
+                    # 압축 성공 시 원본 삭제
+                    if os.path.exists(gz_path):
+                        os.remove(rotated_file)
+        except Exception as e:
+            sys.stderr.write(f"Error processing old logs: {str(e)}\n")
+
+
 def with_logging_context(func: Optional[Callable] = None, **context_kwargs):
     """
-    로깅 컨텍스트를 설정하는 데코레이터
+    로깅 컨텍스트를 설정하는 데코레이터 (성능 최적화 버전)
 
     Args:
         func: 데코레이트할 함수
@@ -912,17 +1461,23 @@ def with_logging_context(func: Optional[Callable] = None, **context_kwargs):
     """
 
     def decorator(f):
+        # 함수 속성으로 컨텍스트 저장 (매번 생성하지 않도록)
+        f.__logging_context__ = context_kwargs
+
         @wraps(f)
         def wrapper(*args, **kwargs):
+            # 성능 모드에서는 INFO 이하 로그 레벨에서 컨텍스트 처리 건너뛰기 (빠른 경로)
+            if os.environ.get("LOG_PERFORMANCE_MODE", "").lower() in ("1", "true", "yes"):
+                current_log_level = logging.getLogger(f.__module__).getEffectiveLevel()
+                if current_log_level > logging.INFO:
+                    return f(*args, **kwargs)
+
             # 로거 이름은 함수가 속한 모듈에서 가져옴
             logger_name = f.__module__
             logger = get_logger(logger_name)
 
-            # 함수 시작 시 컨텍스트 설정
-            logger.with_context(function=f.__name__, **context_kwargs)
-
-            # 함수 실행 시간 측정 시작
-            start_time = time.time()
+            # 함수 시작 시 컨텍스트 설정 (저장된 컨텍스트 사용)
+            logger.with_context(function=f.__name__, **f.__logging_context__)
 
             try:
                 # 실제 함수 실행
@@ -933,11 +1488,7 @@ def with_logging_context(func: Optional[Callable] = None, **context_kwargs):
                 logger.exception(f"Exception in {f.__name__}: {str(e)}")
                 raise
             finally:
-                # 실행 시간 로깅
-                execution_time = time.time() - start_time
-                logger.debug(f"Function {f.__name__} executed in {execution_time:.3f}s")
-
-                # 컨텍스트 정리
+                # 컨텍스트 정리 (최소한의 작업만 수행)
                 logger.clear_context()
 
         return wrapper
@@ -950,9 +1501,82 @@ def with_logging_context(func: Optional[Callable] = None, **context_kwargs):
     return decorator
 
 
+class ConditionalFilter(logging.Filter):
+    """
+    조건에 따라 로그를 필터링하는 필터
+
+    특정 로거나 경로에 대한 로그 레벨을 조정하는 데 사용
+    """
+
+    def __init__(self, name=''):
+        """
+        조건부 필터 초기화
+
+        Args:
+            name: 필터 이름
+        """
+        super().__init__(name)
+        # 기본 설정 로드
+        self.config = get_config()
+        # 로거별 최소 로그 레벨
+        self.logger_levels = {
+            # 외부 라이브러리 로깅 제한
+            'vllm': logging.WARNING,
+            'vllm.engine': logging.WARNING,
+            'vllm.worker': logging.WARNING,
+            'vllm.model_executor': logging.WARNING,
+            'torch': logging.WARNING,
+            'torch.cuda': logging.WARNING,
+            'uvicorn': logging.WARNING,
+            'fastapi': logging.WARNING,
+
+            # 내부 모듈 로깅 레벨 (기본값은 INFO)
+            'mai_vllm_serving.monitoring.metrics': logging.INFO,
+            'mai_vllm_serving.monitoring.profiler': logging.INFO,
+            'mai_vllm_serving.utils.logging_utils': logging.INFO
+        }
+
+        # 환경 변수를 통한 성능 모드 감지
+        self.production_mode = os.environ.get("LOG_PERFORMANCE_MODE", "").lower() in ("1", "true", "yes")
+
+        # 성능 모드에서는 더 엄격한 필터링
+        if self.production_mode:
+            self.logger_levels.update({
+                'mai_vllm_serving.monitoring.metrics': logging.WARNING,
+                'mai_vllm_serving.monitoring.profiler': logging.WARNING,
+                'mai_vllm_serving.utils.logging_utils': logging.WARNING
+            })
+
+    def filter(self, record):
+        """
+        로그 레코드 필터링
+
+        Args:
+            record: 로그 레코드
+
+        Returns:
+            True이면 로그 기록, False면 필터링
+        """
+        # 특정 로거에 대한 최소 레벨 적용
+        logger_name = record.name
+        min_level = logging.INFO  # 기본 최소 레벨
+
+        # 로거 이름 검색 (부모 로거 포함)
+        for name, level in self.logger_levels.items():
+            if logger_name == name or logger_name.startswith(name + '.'):
+                min_level = level
+                break
+
+        # 로그 레벨이 최소 레벨보다 낮으면 필터링
+        if record.levelno < min_level:
+            return False
+
+        return True
+
+
 def with_request_context(func: Optional[Callable] = None, request_id_arg: str = 'request_id'):
     """
-    요청 ID를 로깅 컨텍스트에 설정하는 데코레이터
+    요청 ID를 로깅 컨텍스트에 설정하는 데코레이터 (성능 최적화 버전)
 
     Args:
         func: 데코레이트할 함수
@@ -963,28 +1587,35 @@ def with_request_context(func: Optional[Callable] = None, request_id_arg: str = 
     """
 
     def decorator(f):
+        # 비동기 함수인지 여부 미리 확인 (매 호출마다 확인하지 않도록)
+        is_async = asyncio.iscoroutinefunction(f)
+
         @wraps(f)
         async def async_wrapper(*args, **kwargs):
+            # 성능 모드에서는 정보 기록만 최소화하고 빠르게 처리
+            performance_mode = os.environ.get("LOG_PERFORMANCE_MODE", "").lower() in ("1", "true", "yes")
+
             # 로거 이름은 함수가 속한 모듈에서 가져옴
             logger_name = f.__module__
-            logger = get_logger(logger_name)
+            logger = get_logger(logger_name, production_mode=performance_mode)
 
-            # 요청 ID 설정
+            # 요청 ID 설정 (최소한의 검색만 수행)
             request_id = kwargs.get(request_id_arg)
-            if request_id is None and len(args) > 0:
-                # 첫 번째 인자가 RequestConfig인 경우
-                first_arg = args[0]
-                if hasattr(first_arg, 'request_id'):
-                    request_id = first_arg.request_id
+            if request_id is None and len(args) > 0 and hasattr(args[0], 'request_id'):
+                request_id = args[0].request_id
 
             # 요청 ID가 없으면 생성
             if request_id is None:
                 request_id = str(uuid.uuid4())
 
+            # 요청 ID 설정 (이전 컨텍스트 유지)
             logger.set_request_id(request_id)
-            logger.info(f"Request {request_id} started: with_request_context")
 
-            # 시작 시간 기록
+            # 성능 모드가 아닐 때만 상세 로깅
+            if not performance_mode:
+                logger.info(f"Request {request_id} started")
+
+            # 시작 시간 기록 (성능 모드에서도 필요)
             start_time = time.time()
 
             try:
@@ -992,39 +1623,46 @@ def with_request_context(func: Optional[Callable] = None, request_id_arg: str = 
                 result = await f(*args, **kwargs)
                 return result
             except Exception as e:
-                # 예외 발생 시 로깅
+                # 예외 발생 시 로깅 (항상 수행)
                 logger.exception(f"Request {request_id} failed: {str(e)}")
                 raise
             finally:
-                # 실행 시간 로깅
+                # 실행 시간 계산
                 execution_time = time.time() - start_time
-                logger.info(f"Request {request_id} completed in {execution_time:.3f}s")
+
+                # 성능 모드에서는 긴 요청만 로깅 (100ms 이상)
+                if not performance_mode or execution_time > 0.1:
+                    logger.info(f"Request {request_id} completed in {execution_time:.3f}s")
 
                 # 요청 ID 정리
                 logger.set_request_id(None)
 
         @wraps(f)
         def sync_wrapper(*args, **kwargs):
+            # 성능 모드에서는 정보 기록만 최소화하고 빠르게 처리
+            performance_mode = os.environ.get("LOG_PERFORMANCE_MODE", "").lower() in ("1", "true", "yes")
+
             # 로거 이름은 함수가 속한 모듈에서 가져옴
             logger_name = f.__module__
-            logger = get_logger(logger_name)
+            logger = get_logger(logger_name, production_mode=performance_mode)
 
-            # 요청 ID 설정
+            # 요청 ID 설정 (최소한의 검색만 수행)
             request_id = kwargs.get(request_id_arg)
-            if request_id is None and len(args) > 0:
-                # 첫 번째 인자가 RequestConfig인 경우
-                first_arg = args[0]
-                if hasattr(first_arg, 'request_id'):
-                    request_id = first_arg.request_id
+            if request_id is None and len(args) > 0 and hasattr(args[0], 'request_id'):
+                request_id = args[0].request_id
 
             # 요청 ID가 없으면 생성
             if request_id is None:
                 request_id = str(uuid.uuid4())
 
+            # 요청 ID 설정 (이전 컨텍스트 유지)
             logger.set_request_id(request_id)
-            logger.info(f"Request {request_id} started")
 
-            # 시작 시간 기록
+            # 성능 모드가 아닐 때만 상세 로깅
+            if not performance_mode:
+                logger.info(f"Request {request_id} started")
+
+            # 시작 시간 기록 (성능 모드에서도 필요)
             start_time = time.time()
 
             try:
@@ -1032,22 +1670,22 @@ def with_request_context(func: Optional[Callable] = None, request_id_arg: str = 
                 result = f(*args, **kwargs)
                 return result
             except Exception as e:
-                # 예외 발생 시 로깅
+                # 예외 발생 시 로깅 (항상 수행)
                 logger.exception(f"Request {request_id} failed: {str(e)}")
                 raise
             finally:
-                # 실행 시간 로깅
+                # 실행 시간 계산
                 execution_time = time.time() - start_time
-                logger.info(f"Request {request_id} completed in {execution_time:.3f}s")
+
+                # 성능 모드에서는 긴 요청만 로깅 (100ms 이상)
+                if not performance_mode or execution_time > 0.1:
+                    logger.info(f"Request {request_id} completed in {execution_time:.3f}s")
 
                 # 요청 ID 정리
                 logger.set_request_id(None)
 
         # 비동기 함수인 경우 async_wrapper 반환, 그렇지 않으면 sync_wrapper 반환
-        if asyncio.iscoroutinefunction(f):
-            return async_wrapper
-        else:
-            return sync_wrapper
+        return async_wrapper if is_async else sync_wrapper
 
     # 데코레이터가 인자 없이 직접 사용된 경우
     if func is not None:
@@ -1060,53 +1698,83 @@ def with_request_context(func: Optional[Callable] = None, request_id_arg: str = 
 # 로그 정리 스케줄러 함수
 def schedule_log_cleanup(interval_hours: int = 24):
     """
-    로그 정리 작업 스케줄링
+    로그 정리 작업 스케줄링 (성능 최적화 버전)
 
     Args:
         interval_hours: 정리 작업 실행 간격 (시간)
     """
-    import threading
+    # 환경 변수를 통한 성능 모드 감지
+    production_mode = os.environ.get("LOG_PERFORMANCE_MODE", "").lower() in ("1", "true", "yes")
 
     logger = logging.getLogger(__name__)
-    logger.info(f"Starting log cleanup scheduler (interval: {interval_hours} hours)")
+
+    # 성능 모드에서는 백그라운드 프로세스로 실행 (부하 분산)
+    if production_mode and hasattr(os, 'fork'):
+        # 자식 프로세스에서 실행
+        try:
+            pid = os.fork()
+            if pid > 0:
+                # 부모 프로세스는 즉시 반환
+                logger.info(f"Started log cleanup scheduler in background process (pid: {pid})")
+                return
+
+            # 자식 프로세스만 여기에 도달
+            os.setsid()  # 새 세션 생성
+
+            # 자식 프로세스 로깅 재설정 (콘솔만 사용)
+            for handler in logger.handlers[:]:
+                logger.removeHandler(handler)
+            console_handler = logging.StreamHandler(sys.stdout)
+            console_handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)-8s | %(name)-8s | %(message)s'))
+            logger.addHandler(console_handler)
+
+            logger.info("Log cleanup background process started")
+
+            # 정리 작업 실행 (일정 시간마다)
+            while True:
+                try:
+                    time.sleep(interval_hours * 3600)
+                    # 로그 정리 실행
+                    cleanup_logs()
+                except Exception as e:
+                    logger.error(f"Error in log cleanup process: {str(e)}")
+                    time.sleep(300)  # 오류 발생 시 5분 대기
+
+        except Exception as e:
+            logger.warning(f"Failed to start log cleanup in background process: {str(e)}")
+            # 일반 스레드 방식으로 폴백
+            _schedule_cleanup_thread(interval_hours)
+    else:
+        # 일반 스레드 방식 (Windows 등 fork를 지원하지 않는 플랫폼)
+        _schedule_cleanup_thread(interval_hours)
+
+
+def _schedule_cleanup_thread(interval_hours):
+    """일반 스레드 방식의 로그 정리 스케줄러"""
+    logger = logging.getLogger(__name__)
+    logger.info(f"Starting log cleanup scheduler as thread (interval: {interval_hours} hours)")
 
     def cleanup_task():
         while True:
             try:
-                # 설정에서 로그 경로 가져오기
-                config = get_config()
-                log_file = config.logging.file or "./logs/mai_vllm_serving.log"
-                log_dir = os.path.dirname(log_file)
-
-                # 로그 정책 가져오기
-                max_size_mb = getattr(config.logging, 'max_log_size_mb', 100)
-                backup_count = getattr(config.logging, 'log_backup_count', 30)
-                compression = getattr(config.logging, 'log_compression', True)
-                retention_days = getattr(config.logging, 'log_retention_days', 90)
-
-                # 로그 정책 객체 생성
-                policy = LogRotationPolicy(
-                    base_log_dir=log_dir,
-                    max_size_mb=max_size_mb,
-                    backup_count=backup_count,
-                    compression=compression,
-                    retention_days=retention_days
-                )
+                # 처음에는 일정 시간 대기 (서버 시작 직후 바로 실행하지 않음)
+                time.sleep(interval_hours * 3600)
 
                 # 로그 정리 실행
-                cleanup_result = policy.cleanup_old_logs()
-                size_result = policy.enforce_size_limit()
+                result = cleanup_logs()
+
+                # 결과 로깅
+                cleanup_count = result.get("stats", {}).get("deleted_count", 0)
+                compressed_count = result.get("stats", {}).get("compressed_count", 0)
+                saved_mb = result.get("stats", {}).get("space_saved_mb", 0)
 
                 logger.info(
                     f"Scheduled log cleanup completed: "
-                    f"deleted {cleanup_result['deleted_count']} files, "
-                    f"compressed {cleanup_result['compressed_count']} files, "
-                    f"saved {cleanup_result['total_size_saved_mb']:.2f} MB; "
-                    f"Size check: {size_result['status']}"
+                    f"deleted {cleanup_count} files, "
+                    f"compressed {compressed_count} files, "
+                    f"saved {saved_mb:.2f} MB"
                 )
 
-                # 다음 실행까지 대기
-                time.sleep(interval_hours * 3600)
             except Exception as e:
                 logger.error(f"Error in log cleanup task: {str(e)}")
                 # 오류 발생 시 30분 후 재시도
@@ -1122,15 +1790,18 @@ def schedule_log_cleanup(interval_hours: int = 24):
 
 
 # 로깅 초기화 함수
-def setup_logging(service_name: str = "mai-vllm-serving",
-                  log_level: Optional[str] = None,
-                  log_format: Optional[str] = None,
-                  log_file: Optional[str] = None,
-                  use_json: Optional[bool] = None,
-                  include_caller_info: bool = True,
-                  max_size_mb: int = 100,
-                  backup_count: int = 30,
-                  compression: bool = True) -> logging.Logger:
+def setup_logging(service_name="mai-vllm-serving",
+                  log_level=None,
+                  log_format=None,
+                  log_file=None,
+                  use_json=None,
+                  include_caller_info=True,
+                  max_size_mb=100,
+                  backup_count=30,
+                  compression=True,
+                  performance_mode=False,
+                  async_logging=True,
+                  sampling_rate=1.0):
     """
     향상된 로깅 시스템 초기화
 
@@ -1144,6 +1815,9 @@ def setup_logging(service_name: str = "mai-vllm-serving",
         max_size_mb: 로그 파일 최대 크기 (MB)
         backup_count: 유지할 백업 파일 수
         compression: 압축 활성화 여부
+        performance_mode: 성능 최적화 모드 활성화 여부
+        async_logging: 비동기 로깅 활성화 여부
+        sampling_rate: 로그 샘플링 비율 (0.0~1.0)
 
     Returns:
         설정된 로거 인스턴스
@@ -1200,7 +1874,7 @@ def setup_logging(service_name: str = "mai-vllm-serving",
 
     # 로그 포맷터 생성
     if use_json:
-        formatter = JsonFormatter(service_name, include_caller_info)
+        formatter = OptimizedJsonFormatter(service_name, include_caller_info, lightweight=performance_mode)
     else:
         formatter = CustomFormatter(log_format, datefmt=config.logging.datefmt)
 
@@ -1210,7 +1884,7 @@ def setup_logging(service_name: str = "mai-vllm-serving",
         ensure_log_directory(log_file)
 
         # 고급 일별 로테이션 파일 핸들러 생성
-        file_handler = AdvancedRotatingFileHandler(
+        file_handler = OptimizedRotatingFileHandler(
             filename=log_file,
             when='midnight',  # 매일 자정에 로테이션
             interval=1,  # 1일마다
@@ -1220,22 +1894,43 @@ def setup_logging(service_name: str = "mai-vllm-serving",
             compression=compression  # 압축 여부
         )
         file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
+
+        # 비동기 로깅 사용 여부
+        if async_logging:
+            # 비동기 핸들러로 래핑
+            async_handler = AsyncLogHandler(
+                target_handler=file_handler,
+                queue_size=10000,  # 큐 크기 증가
+                batch_size=100,
+                flush_interval=0.5
+            )
+            logger.addHandler(async_handler)
+        else:
+            logger.addHandler(file_handler)
 
     # 콘솔 핸들러 추가
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
 
+    # 샘플링 필터 추가 (1.0보다 작은 경우에만)
+    if sampling_rate < 1.0:
+        sampling_filter = LogSamplingFilter(sampling_rate=sampling_rate)
+        logger.addFilter(sampling_filter)
+
     # 로깅 설정 정보 출력
     logger.info(f"Logging initialized for {service_name}")
     logger.info(f"Log level: {log_level}")
+    logger.info(f"Performance mode: {performance_mode}, Async logging: {async_logging}")
+    if sampling_rate < 1.0:
+        logger.info(f"Log sampling enabled: {sampling_rate * 100:.1f}% of logs will be recorded")
     logger.info(f"Log format: {'JSON' if use_json else 'Text'}")
     if log_file:
         logger.info(f"Log file: {log_file} (rotation: daily, size limit: {max_size_mb}MB, backups: {backup_count})")
 
-    # 로그 정리 스케줄러 시작
-    schedule_log_cleanup()
+    # 로그 정리 스케줄러 시작 (성능 모드에서는 더 긴 간격으로)
+    interval_hours = 24 if performance_mode else 12
+    schedule_log_cleanup(interval_hours=interval_hours)
 
     return logger
 
@@ -1270,22 +1965,32 @@ def get_structured_logger(name: str) -> StructuredLogger:
 _structured_loggers = {}
 
 
-def get_logger(name: str) -> StructuredLogger:
+def get_logger(name: str, production_mode: bool = None) -> OptimizedStructuredLogger:
     """
-    구조화된 로거 인스턴스 가져오기 (싱글톤)
+    구조화된 로거 인스턴스 가져오기 (싱글톤, 성능 최적화)
 
     Args:
         name: 로거 이름
+        production_mode: 프로덕션 모드 여부 (None이면 환경 변수에서 결정)
 
     Returns:
-        StructuredLogger 인스턴스
+        OptimizedStructuredLogger 인스턴스
     """
     global _structured_loggers
 
-    if name not in _structured_loggers:
-        _structured_loggers[name] = get_structured_logger(name)
+    # production_mode가 명시되지 않은 경우 환경 변수 확인
+    if production_mode is None:
+        # 환경 변수로 성능 모드 결정
+        production_mode = os.environ.get("LOG_PERFORMANCE_MODE", "").lower() in ("1", "true", "yes")
 
-    return _structured_loggers[name]
+    # 키를 (이름, 모드)로 구성하여 같은 이름이라도 모드에 따라 다른 인스턴스 사용
+    key = (name, production_mode)
+
+    if key not in _structured_loggers:
+        base_logger = logging.getLogger(name)
+        _structured_loggers[key] = OptimizedStructuredLogger(base_logger, production_mode)
+
+    return _structured_loggers[key]
 
 
 # 로그 정리 기능
