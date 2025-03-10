@@ -12,6 +12,7 @@ import os
 import queue
 import random
 import shutil
+import sys
 import threading
 import time
 import traceback
@@ -19,7 +20,7 @@ import uuid
 from datetime import datetime, timedelta
 from functools import wraps
 from logging.handlers import TimedRotatingFileHandler
-from typing import Optional, Dict, Any, Callable, List
+from typing import Optional, Dict, Any, Callable, List, Union
 
 # 설정 모듈 임포트
 from mai_vllm_serving.utils.config import get_config
@@ -826,7 +827,7 @@ class TimingContext:
 
     __slots__ = ('logger', 'label', 'start_time', 'end_time', 'log_threshold', 'production_mode')
 
-    def __init__(self, logger: Optional[logging.Logger, 'StructuredLogger', 'OptimizedStructuredLogger'] = None,
+    def __init__(self, logger: Optional[Union[logging.Logger, 'StructuredLogger', 'OptimizedStructuredLogger']] = None,
                  label: str = "Operation",
                  log_threshold: Optional[float] = None):
         """
