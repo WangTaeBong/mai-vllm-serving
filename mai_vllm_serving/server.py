@@ -691,6 +691,14 @@ async def generate(
                 request_id=request_id
             )
 
+            # 만약 generated_text가 따옴표로 시작하고 끝난다면 따옴표 제거
+            if "generated_text" in result and isinstance(result["generated_text"], str):
+                text = result["generated_text"]
+                if text.startswith(' "') and text.endswith('"'):
+                    result["generated_text"] = text[2:-1]
+                elif text.startswith('"') and text.endswith('"'):
+                    result["generated_text"] = text[1:-1]
+
             return JSONResponse(content=result)
 
     except Exception as e:

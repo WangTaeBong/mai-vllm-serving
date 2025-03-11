@@ -35,6 +35,13 @@ performance_mode = config.logging.log_performance_mode
 logger = get_logger("engine", production_mode=performance_mode)
 
 
+# 따옴표 제거 도우미 함수
+def remove_quotes_if_needed(text):
+    if isinstance(text, str) and text.startswith('"') and text.endswith('"'):
+        return text[1:-1]
+    return text
+
+
 @dataclass
 class RequestConfig:
     """추론 요청 설정을 위한 데이터 클래스"""
@@ -542,6 +549,10 @@ class MAIVLLMEngine:
                 )
 
                 if should_send_batch and current_batch:  # 배치에 내용이 있을 경우에만 전송
+                    # 텍스트 처리
+                    current_batch = remove_quotes_if_needed(current_batch)
+                    current_text = remove_quotes_if_needed(current_text)
+
                     # 응답 객체 구성
                     response = {
                         "id": request_id,
