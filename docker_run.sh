@@ -8,12 +8,24 @@ CONTAINER_NAME="mai-vllm-serving"
 MODEL_DIR="/data/vllm-models"
 LOG_DIR="/applog/mai-vllm-serving"
 CONFIG_DIR="/app/mai-vllm-serving/configs"
+CACHE_DIR="/app/mai-vllm-serving/cache"  # 캐시 디렉토리 추가
 
 # 포트 설정 (기본값: 8020)
 PORT=8020
 
 # 사용자 설정 - 원하는 사용자로 실행 (비어있으면 컨테이너 기본값 사용)
 use_user='aicess' # 예: use_user='aicess'
+
+# 필요한 디렉토리 생성
+mkdir -p ${CACHE_DIR}
+
+# 디렉토리 권한 설정
+if [ "$use_user" != '' ]; then
+    chown -R $use_user:$use_user ${LOG_DIR}
+    chown -R $use_user:$use_user ${CACHE_DIR}
+    chmod 755 ${LOG_DIR}
+    chmod 755 ${CACHE_DIR}
+fi
 
 # 사용자 ID 설정
 docker_user=''
@@ -71,11 +83,12 @@ start_container() {
     else
         echo "새 컨테이너를 생성하고 시작합니다..."
 
-        # 필요한 디렉토리 생성
+        # 필요한 디렉토리 생성 확인
         mkdir -p ${LOG_DIR}
+        mkdir -p ${CACHE_DIR}
 
         # 로그 파일 경로 설정 - 컨테이너 내부의 로그 디렉토리에 저장
-        INTERNAL_LOG_DIR="/app/internal-logs"
+        INTERNAL_LOG_DIR="/app/logs"
         LOG_FILE_PATH="${INTERNAL_LOG_DIR}/mai-vllm-serving.log"
 
         # 컨테이너 실행
@@ -85,17 +98,16 @@ start_container() {
             -v ${MODEL_DIR}:/app/models \
             -v ${LOG_DIR}:/app/logs \
             -v ${CONFIG_DIR}:/app/configs \
+            -v ${CACHE_DIR}:/app/cache \
             -p ${PORT}:8020 \
             -e NVIDIA_VISIBLE_DEVICES=all \
             -e NVIDIA_DRIVER_CAPABILITIES=all \
-            -e LOGGING_FILE_PATH="${LOG_FILE_PATH}" \
-            -e HF_HOME="/app/.cache/huggingface" \
-            -e TRANSFORMERS_CACHE="/app/.cache/huggingface" \
-            -e XDG_CACHE_HOME="/app/.cache" \
-            --entrypoint=/entrypoint.sh \
+            -e HF_HOME="/app/cache/huggingface" \
+            -e XDG_CACHE_HOME="/app/cache" \
+            -e TZ=Asia/Seoul \
             -d \
             ${IMAGE_NAME} \
-            python3 -m mai_vllm_serving.server --log-file ${LOG_FILE_PATH}
+            python -m mai_vllm_serving.server --log-file ${LOG_FILE_PATH}
     fi
 
     # 실행 결과 확인
