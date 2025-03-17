@@ -748,13 +748,15 @@ async def _stream_response_generator(engine_request: RequestConfig, timing: Timi
     try:
         # 엔진에서 스트리밍 응답 반환 - 제너레이터이므로 그대로 사용 가능
         llm_engine = EngineManager.get_instance()
-        async for chunk in await llm_engine.generate(engine_request):
+
+        async for chunk in generate_without_quotes(llm_engine, engine_request):
             # 토큰 카운트 업데이트 (new_text가 있는 경우)
             if "new_text" in chunk:
                 token_count += 1  # 정확한 토큰 수를 모르기 때문에 청크 수로 근사
 
             # UTF-8 인코딩을 보장하는 JSON 직렬화
             response_json = json.dumps(chunk, ensure_ascii=False)
+            logger.info("response_json: %s", response_json)
             yield f"data: {response_json}\n\n"
 
             # 완료 시 로깅
@@ -799,6 +801,59 @@ async def _stream_response_generator(engine_request: RequestConfig, timing: Timi
     logger.debug(f"Stream generator completed",
                  context={"streaming": {"request_id": request_id}})
     yield f"data: [DONE]\n\n"
+
+
+async def generate_without_quotes(engine, engine_request):
+    """
+    따옴표 제거를 적용한 텍스트 생성 래퍼 함수
+
+    Args:
+        engine: vLLM 엔진 인스턴스
+        engine_request: 생성 요청 설정
+
+    Yields:
+        따옴표가 제거된 응답 청크
+    """
+    # 첫 청크 여부 추적
+    is_first_chunk = True
+    accumulated_text = ""
+
+    async for chunk in await engine.generate(engine_request):
+        # 청크 복사하여 수정
+        modified_chunk = dict(chunk)
+
+        # new_text 처리
+        if "new_text" in modified_chunk:
+            new_text = modified_chunk["new_text"]
+
+            # 첫 번째 청크이고 따옴표로 시작하는 경우
+            if is_first_chunk and new_text.startswith(' "'):
+                new_text = new_text[2:]  # 시작 따옴표 제거
+            elif is_first_chunk and new_text.startswith('"'):
+                new_text = new_text[1:]  # 시작 따옴표 제거
+
+            is_first_chunk = False
+
+            # 마지막 청크이고 따옴표로 끝나는 경우
+            if modified_chunk.get("finished", False) and new_text.endswith('"'):
+                new_text = new_text[:-1]  # 끝 따옴표 제거
+
+            modified_chunk["new_text"] = new_text
+
+        # generated_text 처리 (첫 청크 또는 마지막 청크에 존재)
+        if "generated_text" in modified_chunk:
+            text = modified_chunk["generated_text"]
+            accumulated_text = text  # 전체 텍스트 추적
+
+            # 따옴표로 감싸인 경우 제거
+            if text.startswith(' "') and text.endswith('"'):
+                text = text[2:-1]
+            elif text.startswith('"') and text.endswith('"'):
+                text = text[1:-1]
+
+            modified_chunk["generated_text"] = text
+
+        yield modified_chunk
 
 
 @app.get("/health")
