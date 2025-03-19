@@ -1,0 +1,923 @@
+#!/bin/bash
+
+# aivllm - 커맨드라인에서 mai-vllm-serving과 대화하는 향상된 스크립트
+# 사용법: ./aivllm [options]
+#   실행 후 프롬프트에 질문을 입력하세요
+#   명령어는 .으로 시작합니다 (.help로 도움말 확인)
+
+# 설정 파일 경로
+CONFIG_DIR="$HOME/.config/aivllm"
+CONFIG_FILE="$CONFIG_DIR/config.json"
+
+# 기본 설정 변수
+SERVER_URL="http://localhost:8020/generate"
+MAX_TOKENS=1024
+TEMPERATURE=0.7
+TOP_P=0.9
+TOP_K=40
+FREQUENCY_PENALTY=0.2
+PRESENCE_PENALTY=0.2
+REPETITION_PENALTY=1.2
+STREAMING=true
+
+# 초기화 부분에 상세 로깅 추가
+if [ -x "/snap/bin/glow" ]; then
+    echo "glow 발견: /snap/bin/glow"
+    GLOW_PATH="/snap/bin/glow"
+    # 설정 강제 적용
+    MARKDOWN_MODE=true
+elif command -v glow &> /dev/null; then
+    GLOW_PATH="glow"
+    echo "glow 발견: $(which glow)"
+    # 설정 강제 적용
+    MARKDOWN_MODE=true
+else
+    echo "glow를 찾을 수 없습니다"
+    MARKDOWN_MODE=false
+fi
+
+# 히스토리 설정
+HISTORY_FILE="$CONFIG_DIR/history.jsonl"
+MAX_HISTORY=100
+
+# 모드 설정
+MARKDOWN_MODE=true
+CONVERSATION_MODE=true
+
+# 출력 형식 설정
+OUTPUT_WIDTH=80
+
+# 반복 감지 설정
+REPEAT_THRESHOLD=3
+
+# 터미널 색상 설정
+BLUE='\033[0;34m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+RED='\033[0;31m'
+MAGENTA='\033[0;35m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+ITALIC='\033[3m'
+NC='\033[0m' # No Color
+
+# 터미널 기능 감지
+if [ -t 1 ]; then
+    INTERACTIVE=true
+    TERM_COLS=$(tput cols 2>/dev/null || echo 80)
+    # 터미널 너비를 기준으로 출력 너비 조정
+    OUTPUT_WIDTH=$((TERM_COLS > 100 ? 100 : TERM_COLS))
+else
+    INTERACTIVE=false
+    OUTPUT_WIDTH=80
+fi
+
+# 의존성 확인 - glow가 snap에 설치된 경우 고려
+check_dependencies() {
+    local missing=()
+
+    # curl과 jq 확인
+    for cmd in curl jq; do
+        if ! command -v $cmd &> /dev/null; then
+            missing+=("$cmd")
+        fi
+    done
+
+    # glow 확인 (snap 설치 경로 포함)
+    if ! command -v glow &> /dev/null && ! [ -x "/snap/bin/glow" ]; then
+        missing+=("glow")
+    else
+        # glow 경로 설정 (전역 변수)
+        if [ -x "/usr/bin/glow" ]; then
+            GLOW_PATH="/usr/bin/glow"
+        else
+            GLOW_PATH="glow"
+        fi
+    fi
+
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo -e "${YELLOW}경고: 다음 의존성이 누락되었습니다:${NC}"
+        for cmd in "${missing[@]}"; do
+            case $cmd in
+                jq)
+                    echo -e "  - ${RED}jq${NC}: JSON 파싱을 위한 필수 도구입니다."
+                    echo -e "     설치 방법: apt install jq"
+                    ;;
+                glow)
+                    echo -e "  - ${YELLOW}glow${NC}: 마크다운 렌더링을 위한 도구입니다 (선택 사항)."
+                    echo -e "     마크다운 모드를 사용하기 위해 필요합니다."
+                    echo -e "     설치 방법: apt install glow"
+                    MARKDOWN_MODE=false
+                    ;;
+                *)
+                    echo -e "  - ${RED}$cmd${NC}"
+                    ;;
+            esac
+        done
+        echo ""
+    fi
+    
+    # jq가 없으면 실행이 어려움
+    if [[ " ${missing[@]} " =~ " jq " ]]; then
+        echo -e "${RED}오류: jq는 필수 의존성입니다. 설치 후 다시 실행해주세요.${NC}"
+        exit 1
+    fi
+}
+
+# 설정 파일 생성 및 로드
+create_default_config() {
+    mkdir -p "$CONFIG_DIR"
+    cat > "$CONFIG_FILE" << EOF
+{
+  "server_url": "$SERVER_URL",
+  "parameters": {
+    "max_tokens": $MAX_TOKENS,
+    "temperature": $TEMPERATURE,
+    "top_p": $TOP_P,
+    "top_k": $TOP_K,
+    "frequency_penalty": $FREQUENCY_PENALTY,
+    "presence_penalty": $PRESENCE_PENALTY,
+    "repetition_penalty": $REPETITION_PENALTY
+  },
+  "ui": {
+    "markdown_mode": ${MARKDOWN_MODE},
+    "conversation_mode": ${CONVERSATION_MODE},
+    "output_width": $OUTPUT_WIDTH
+  },
+  "presets": {
+    "creative": {
+      "temperature": 0.9,
+      "top_p": 0.95,
+      "frequency_penalty": 0.3,
+      "presence_penalty": 0.3
+    },
+    "precise": {
+      "temperature": 0.1,
+      "top_p": 0.9,
+      "frequency_penalty": 0.1,
+      "presence_penalty": 0.1
+    },
+    "balanced": {
+      "temperature": 0.7,
+      "top_p": 0.9,
+      "frequency_penalty": 0.2,
+      "presence_penalty": 0.2
+    },
+    "code": {
+      "temperature": 0.2,
+      "top_p": 0.95,
+      "frequency_penalty": 0.1,
+      "presence_penalty": 0.1,
+      "repetition_penalty": 1.0
+    }
+  },
+  "prompts": {
+    "assistant": "당신은 도움이 되는 AI 비서입니다. 사용자의 질문에 명확하고 정확하게 답변해주세요.",
+    "programmer": "당신은 프로그래밍 전문가입니다. 코드 관련 질문에 최적화된 예제와 함께 답변해주세요.",
+    "teacher": "당신은 교육 전문가입니다. 학습하는 사람에게 이해하기 쉽게 개념을 설명해주세요."
+  }
+}
+EOF
+    echo -e "${GREEN}기본 설정 파일이 생성되었습니다: $CONFIG_FILE${NC}"
+}
+
+# 설정 로드
+load_config() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        create_default_config
+    fi
+    
+    # 서버 URL 로드
+    SERVER_URL=$(jq -r '.server_url' "$CONFIG_FILE")
+    
+    # 파라미터 로드
+    MAX_TOKENS=$(jq -r '.parameters.max_tokens' "$CONFIG_FILE")
+    TEMPERATURE=$(jq -r '.parameters.temperature' "$CONFIG_FILE")
+    TOP_P=$(jq -r '.parameters.top_p' "$CONFIG_FILE")
+    TOP_K=$(jq -r '.parameters.top_k' "$CONFIG_FILE")
+    FREQUENCY_PENALTY=$(jq -r '.parameters.frequency_penalty' "$CONFIG_FILE")
+    PRESENCE_PENALTY=$(jq -r '.parameters.presence_penalty' "$CONFIG_FILE")
+    REPETITION_PENALTY=$(jq -r '.parameters.repetition_penalty' "$CONFIG_FILE")
+    
+    # UI 설정 로드
+    # UI 설정 로드 (MARKDOWN_MODE 설정 유지)
+    if [ "$MARKDOWN_MODE" != "true" ]; then  # 이미 true로 설정된 경우 유지
+        MARKDOWN_MODE=$(jq -r '.ui.markdown_mode' "$CONFIG_FILE")
+    fi
+    CONVERSATION_MODE=$(jq -r '.ui.conversation_mode' "$CONFIG_FILE")
+    OUTPUT_WIDTH=$(jq -r '.ui.output_width' "$CONFIG_FILE")
+    
+    # 값 검증: 마크다운 모드는 glow가 있을 때만 활성화
+    if [ "$MARKDOWN_MODE" = "true" ] && ! command -v glow &> /dev/null; then
+        MARKDOWN_MODE=false
+        echo -e "${YELLOW}경고: glow가 설치되지 않아 마크다운 모드를 비활성화합니다.${NC}"
+    fi
+}
+
+# 대화 히스토리 관리
+init_history() {
+    mkdir -p "$CONFIG_DIR"
+    if [ ! -f "$HISTORY_FILE" ]; then
+        touch "$HISTORY_FILE"
+    fi
+}
+
+add_to_history() {
+    local prompt="$1"
+    local response="$2"
+    local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    
+    # 히스토리에 추가
+    echo "{\"timestamp\":\"$timestamp\",\"prompt\":\"$prompt\",\"response\":\"$response\"}" >> "$HISTORY_FILE"
+
+    # 최대 기록 수 유지
+    if [ $(wc -l < "$HISTORY_FILE") -gt $MAX_HISTORY ]; then
+        tail -n $MAX_HISTORY "$HISTORY_FILE" > "$HISTORY_FILE.tmp"
+        mv "$HISTORY_FILE.tmp" "$HISTORY_FILE"
+    fi
+}
+
+show_history() {
+    local count=${1:-10}
+    if [ ! -s "$HISTORY_FILE" ]; then
+        echo -e "${YELLOW}대화 히스토리가 비어 있습니다.${NC}"
+        return
+    fi
+
+    echo -e "${BLUE}최근 $count개 대화:${NC}"
+
+    # 최근 n개 항목 표시
+    local total_lines=$(wc -l < "$HISTORY_FILE")
+    local start_line=$((total_lines - count + 1))
+    [ $start_line -lt 1 ] && start_line=1
+
+    local line_num=$start_line
+    tail -n $count "$HISTORY_FILE" | while read -r line; do
+        local entry_num=$((line_num - start_line + 1))
+        local timestamp=$(echo "$line" | jq -r '.timestamp')
+        local date_display=$(date -d "$timestamp" "+%Y-%m-%d %H:%M" 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%SZ" "$timestamp" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "$timestamp")
+        local prompt=$(echo "$line" | jq -r '.prompt')
+        local truncated_prompt=$(echo "$prompt" | cut -c 1-60)
+        [ ${#prompt} -gt 60 ] && truncated_prompt+="..."
+
+        echo -e "${CYAN}$entry_num.${NC} ${YELLOW}[$date_display]${NC} $truncated_prompt"
+        line_num=$((line_num + 1))
+    done
+}
+
+get_history_entry() {
+    local entry_num=$1
+    local total_lines=$(wc -l < "$HISTORY_FILE")
+
+    if [ $entry_num -lt 1 ] || [ $entry_num -gt $total_lines ]; then
+        echo "error:out_of_range"
+        return 1
+    fi
+
+    local entry=$(sed -n "${entry_num}p" "$HISTORY_FILE")
+    echo "$entry" | jq -r '.prompt'
+}
+
+clear_history() {
+    echo -e "${YELLOW}대화 히스토리를 삭제하시겠습니까? (y/N)${NC}"
+    read -e -r confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        echo "" > "$HISTORY_FILE"
+        echo -e "${GREEN}대화 히스토리가 삭제되었습니다.${NC}"
+    else
+        echo -e "${BLUE}취소되었습니다.${NC}"
+    fi
+}
+
+# 프리셋 및 시스템 프롬프트 관리
+apply_preset() {
+    local preset_name=$1
+    if [ -z "$preset_name" ]; then
+        echo -e "${YELLOW}사용 가능한 프리셋:${NC}"
+        jq -r '.presets | keys[]' "$CONFIG_FILE" | while read -r name; do
+            echo -e "  - ${GREEN}$name${NC}"
+        done
+        return
+    fi
+
+    # 프리셋 존재 여부 확인
+    if ! jq -e ".presets.$preset_name" "$CONFIG_FILE" > /dev/null 2>&1; then
+        echo -e "${RED}오류: '$preset_name' 프리셋을 찾을 수 없습니다.${NC}"
+        return 1
+    fi
+
+    # 프리셋 적용
+    local temp=$(jq -r ".presets.$preset_name.temperature" "$CONFIG_FILE")
+    [ "$temp" != "null" ] && TEMPERATURE=$temp
+
+    local top_p=$(jq -r ".presets.$preset_name.top_p" "$CONFIG_FILE")
+    [ "$top_p" != "null" ] && TOP_P=$top_p
+
+    local top_k=$(jq -r ".presets.$preset_name.top_k" "$CONFIG_FILE")
+    [ "$top_k" != "null" ] && TOP_K=$top_k
+
+    local freq=$(jq -r ".presets.$preset_name.frequency_penalty" "$CONFIG_FILE")
+    [ "$freq" != "null" ] && FREQUENCY_PENALTY=$freq
+
+    local pres=$(jq -r ".presets.$preset_name.presence_penalty" "$CONFIG_FILE")
+    [ "$pres" != "null" ] && PRESENCE_PENALTY=$pres
+
+    local rep=$(jq -r ".presets.$preset_name.repetition_penalty" "$CONFIG_FILE")
+    [ "$rep" != "null" ] && REPETITION_PENALTY=$rep
+
+    echo -e "${GREEN}'$preset_name' 프리셋이 적용되었습니다.${NC}"
+    return 0
+}
+
+load_system_prompt() {
+    local prompt_name=$1
+    if [ -z "$prompt_name" ]; then
+        echo -e "${YELLOW}사용 가능한 시스템 프롬프트:${NC}"
+        jq -r '.prompts | keys[]' "$CONFIG_FILE" | while read -r name; do
+            echo -e "  - ${GREEN}$name${NC}"
+        done
+        return
+    fi
+
+    # 프롬프트 존재 여부 확인
+    if ! jq -e ".prompts.$prompt_name" "$CONFIG_FILE" > /dev/null 2>&1; then
+        echo -e "${RED}오류: '$prompt_name' 프롬프트를 찾을 수 없습니다.${NC}"
+        return 1
+    fi
+
+    # 프롬프트 내용 반환
+    jq -r ".prompts.$prompt_name" "$CONFIG_FILE"
+    return 0
+}
+
+save_preset() {
+    local preset_name=$1
+    if [ -z "$preset_name" ]; then
+        echo -e "${RED}오류: 프리셋 이름을 지정해야 합니다.${NC}"
+        return 1
+    fi
+
+    # 기존 설정 불러오기
+    local config=$(cat "$CONFIG_FILE")
+
+    # 현재 설정으로 프리셋 업데이트
+    config=$(echo "$config" | jq ".presets.$preset_name = {
+        \"temperature\": $TEMPERATURE,
+        \"top_p\": $TOP_P,
+        \"top_k\": $TOP_K,
+        \"frequency_penalty\": $FREQUENCY_PENALTY,
+        \"presence_penalty\": $PRESENCE_PENALTY,
+        \"repetition_penalty\": $REPETITION_PENALTY
+    }")
+
+    # 설정 파일에 저장
+    echo "$config" > "$CONFIG_FILE"
+    echo -e "${GREEN}'$preset_name' 프리셋이 저장되었습니다.${NC}"
+    return 0
+}
+
+save_system_prompt() {
+    local prompt_name=$1
+    local prompt_text=$2
+    if [ -z "$prompt_name" ] || [ -z "$prompt_text" ]; then
+        echo -e "${RED}오류: 프롬프트 이름과 내용을 모두 지정해야 합니다.${NC}"
+        return 1
+    fi
+
+    # 기존 설정 불러오기
+    local config=$(cat "$CONFIG_FILE")
+
+    # 프롬프트 업데이트
+    config=$(echo "$config" | jq ".prompts.$prompt_name = \"$prompt_text\"")
+
+    # 설정 파일에 저장
+    echo "$config" > "$CONFIG_FILE"
+    echo -e "${GREEN}'$prompt_name' 프롬프트가 저장되었습니다.${NC}"
+    return 0
+}
+
+# 마크다운 렌더링 함수 - snap 설치 고려
+render_markdown() {
+    local text="$1"
+    local width=${2:-$OUTPUT_WIDTH}
+
+    if [ "$MARKDOWN_MODE" = "true" ]; then
+        # 임시 파일에 마크다운 저장
+        local tmp_file=$(mktemp)
+        echo "$text" > "$tmp_file"
+
+        # glow로 렌더링하고 임시 파일 삭제
+        if [ -n "$GLOW_PATH" ]; then
+            "$GLOW_PATH" -w $width "$tmp_file"
+        else
+            # 폴백 - 일반 텍스트로 출력
+            echo -e "$text"
+        fi
+        rm "$tmp_file"
+    else
+        # 마크다운 없이 일반 텍스트로 출력
+        echo -e "$text"
+    fi
+}
+
+# SSE 스트림 처리 함수 (단순화된 버전)
+process_sse() {
+    local line
+    local full_response=""
+
+    while read -r line; do
+        # "data: " 접두사 확인 및 제거
+        if [[ "$line" == data:* ]]; then
+            line="${line#data: }"
+
+            # [DONE] 메시지 처리
+            if [ "$line" == "[DONE]" ]; then
+                break
+            fi
+
+            # 새 텍스트 추출
+            new_text=$(echo "$line" | jq -r '.new_text // empty')
+            if [ -n "$new_text" ]; then
+                # 즉시 표준 출력으로 출력 (중요!)
+                printf "%s" "$new_text"
+                full_response+="$new_text"
+            fi
+
+            # 오류 확인
+            error=$(echo "$line" | jq -r '.error // empty')
+            if [ -n "$error" ]; then
+                echo -e "\n${RED}오류: $error${NC}" >&2
+            fi
+        fi
+    done
+
+    # 전체 응답 저장
+    echo "$full_response" > "$SSE_RESPONSE_FILE"
+}
+
+# JSON 문자열 이스케이프 함수
+escape_json_string() {
+    local input="$1"
+    # JSON 문자열에서 특수 문자 이스케이프
+    echo "$input" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\//\\\//g; s/\b/\\b/g; s/\f/\\f/g; s/\n/\\n/g; s/\r/\\r/g; s/\t/\\t/g'
+}
+
+# 시스템 프롬프트 적용하여 최종 프롬프트 생성
+create_prompt_with_system() {
+    local user_prompt="$1"
+    local system_prompt_name="$2"
+
+    if [ -n "$system_prompt_name" ]; then
+        local system_content=$(load_system_prompt "$system_prompt_name")
+        if [ $? -eq 0 ] && [ -n "$system_content" ]; then
+            echo "${system_content}
+
+사용자: ${user_prompt}"
+        else
+            echo "$user_prompt"
+        fi
+    else
+        echo "$user_prompt"
+    fi
+}
+
+# 도움말 표시
+show_help() {
+    echo -e "${BLUE}=====================================================${NC}"
+    echo -e "${BLUE}  aivllm - mai-vllm-serving 커맨드라인 인터페이스   ${NC}"
+    echo -e "${BLUE}=====================================================${NC}"
+    echo -e "${YELLOW}사용 가능한 명령어:${NC}"
+    echo -e "  ${GREEN}.help${NC}                   - 이 도움말 표시"
+    echo -e "  ${GREEN}.exit${NC}, ${GREEN}.bye${NC}           - 프로그램 종료"
+    echo -e "  ${GREEN}.params${NC}                 - 현재 파라미터 표시 및 수정"
+    echo -e "  ${GREEN}.preset [이름]${NC}          - 파라미터 프리셋 적용 또는 목록 표시"
+    echo -e "  ${GREEN}.save_preset [이름]${NC}     - 현재 파라미터를 프리셋으로 저장"
+    echo -e "  ${GREEN}.prompts${NC}                - 시스템 프롬프트 목록 표시"
+    echo -e "  ${GREEN}.use [프롬프트명]${NC}       - 시스템 프롬프트 사용"
+    echo -e "  ${GREEN}.save_prompt [이름] [내용]${NC} - 시스템 프롬프트 저장"
+    echo -e "  ${GREEN}.history [숫자]${NC}         - 이전 대화 기록 표시 (기본: 10개)"
+    echo -e "  ${GREEN}.clear_history${NC}          - 대화 기록 삭제"
+    echo -e "  ${GREEN}.r [숫자]${NC}               - 이전 대화 재사용"
+    echo -e "  ${GREEN}.toggle_md${NC}              - 마크다운 모드 토글"
+    echo -e "  ${GREEN}.toggle_stream${NC}          - 스트리밍 모드 토글"
+    echo -e "${BLUE}=====================================================${NC}"
+    echo -e "${YELLOW}팁: 파라미터를 조정하려면 .params 명령어를 사용하세요.${NC}"
+    echo -e "${YELLOW}도움이 필요하면 언제든 .help를 입력하세요.${NC}"
+    echo -e "${BLUE}=====================================================${NC}"
+}
+
+# 배너 표시
+show_banner() {
+    echo -e "${BLUE}=====================================================${NC}"
+    echo -e "${BLUE}  aivllm - mai-vllm-serving 커맨드라인 인터페이스   ${NC}"
+    echo -e "${BLUE}=====================================================${NC}"
+    echo -e "${YELLOW}질문을 입력하세요. 도움말은 .help를 입력하세요.${NC}"
+
+    # 현재 적용된 설정 표시
+    echo -e "${CYAN}서버:${NC} $SERVER_URL"
+    echo -e "${CYAN}모드:${NC} 마크다운=$([ "$MARKDOWN_MODE" = "true" ] && echo "켜짐" || echo "꺼짐") 스트리밍=$([ "$STREAMING" = "true" ] && echo "켜짐" || echo "꺼짐")"
+
+    echo -e "${BLUE}=====================================================${NC}"
+}
+
+# 현재 파라미터 표시 및 수정
+manage_parameters() {
+    echo -e "${BLUE}현재 파라미터:${NC}"
+    echo -e "  ${CYAN}Temperature:${NC} ${GREEN}${TEMPERATURE}${NC}"
+    echo -e "  ${CYAN}Top-p:${NC} ${GREEN}${TOP_P}${NC}"
+    echo -e "  ${CYAN}Top-k:${NC} ${GREEN}${TOP_K}${NC}"
+    echo -e "  ${CYAN}Frequency Penalty:${NC} ${GREEN}${FREQUENCY_PENALTY}${NC}"
+    echo -e "  ${CYAN}Presence Penalty:${NC} ${GREEN}${PRESENCE_PENALTY}${NC}"
+    echo -e "  ${CYAN}Repetition Penalty:${NC} ${GREEN}${REPETITION_PENALTY}${NC}"
+    echo -e "  ${CYAN}Max Tokens:${NC} ${GREEN}${MAX_TOKENS}${NC}"
+
+    echo -e "${YELLOW}변경할 파라미터를 입력하세요 (예: temp=0.8 또는 all=default):${NC}"
+    read -e -r PARAM_CMD
+
+    if [[ "$PARAM_CMD" == "all=default" ]]; then
+        TEMPERATURE=0.7
+        TOP_P=0.9
+        TOP_K=40
+        FREQUENCY_PENALTY=0.2
+        PRESENCE_PENALTY=0.2
+        REPETITION_PENALTY=1.2
+        MAX_TOKENS=1024
+        echo -e "${GREEN}모든 파라미터가 기본값으로 재설정되었습니다.${NC}"
+    else
+        # 개별 파라미터 설정
+        IFS=' ' read -ra PARAMS <<< "$PARAM_CMD"
+        for PARAM in "${PARAMS[@]}"; do
+            KEY=$(echo $PARAM | cut -d= -f1)
+            VALUE=$(echo $PARAM | cut -d= -f2)
+
+            case "$KEY" in
+                temp|temperature)
+                    TEMPERATURE=$VALUE
+                    echo -e "${GREEN}Temperature가 $VALUE로 설정되었습니다.${NC}"
+                    ;;
+                topp|top_p)
+                    TOP_P=$VALUE
+                    echo -e "${GREEN}Top-p가 $VALUE로 설정되었습니다.${NC}"
+                    ;;
+                topk|top_k)
+                    TOP_K=$VALUE
+                    echo -e "${GREEN}Top-k가 $VALUE로 설정되었습니다.${NC}"
+                    ;;
+                freq|frequency)
+                    FREQUENCY_PENALTY=$VALUE
+                    echo -e "${GREEN}Frequency Penalty가 $VALUE로 설정되었습니다.${NC}"
+                    ;;
+                pres|presence)
+                    PRESENCE_PENALTY=$VALUE
+                    echo -e "${GREEN}Presence Penalty가 $VALUE로 설정되었습니다.${NC}"
+                    ;;
+                rep|repetition)
+                    REPETITION_PENALTY=$VALUE
+                    echo -e "${GREEN}Repetition Penalty가 $VALUE로 설정되었습니다.${NC}"
+                    ;;
+                max|max_tokens)
+                    MAX_TOKENS=$VALUE
+                    echo -e "${GREEN}Max Tokens가 $VALUE로 설정되었습니다.${NC}"
+                    ;;
+                *)
+                    echo -e "${RED}알 수 없는 파라미터: $KEY${NC}"
+                    ;;
+            esac
+        done
+    fi
+}
+
+# 토글 함수
+toggle_markdown_mode() {
+    if command -v glow &> /dev/null; then
+        if [ "$MARKDOWN_MODE" = "true" ]; then
+            MARKDOWN_MODE=false
+            echo -e "${YELLOW}마크다운 모드가 비활성화되었습니다.${NC}"
+        else
+            MARKDOWN_MODE=true
+            echo -e "${GREEN}마크다운 모드가 활성화되었습니다.${NC}"
+        fi
+
+        # 설정 업데이트
+        local config=$(cat "$CONFIG_FILE")
+        config=$(echo "$config" | jq ".ui.markdown_mode = $MARKDOWN_MODE")
+        echo "$config" > "$CONFIG_FILE"
+    else
+        echo -e "${RED}오류: 마크다운 렌더링을 위해 'glow' 설치가 필요합니다.${NC}"
+        echo -e "${YELLOW}설치 방법: brew install glow 또는 apt install glow${NC}"
+    fi
+}
+
+toggle_streaming_mode() {
+    if [ "$STREAMING" = "true" ]; then
+        STREAMING=false
+        echo -e "${YELLOW}스트리밍 모드가 비활성화되었습니다.${NC}"
+    else
+        STREAMING=true
+        echo -e "${GREEN}스트리밍 모드가 활성화되었습니다.${NC}"
+    fi
+}
+
+# API 호출 및 응답 처리
+call_api() {
+    local prompt="$1"
+    local system_prompt_name="$2"
+
+    # 프롬프트 생성 및 이스케이프 처리
+    local final_prompt="$prompt"
+    if [ -n "$system_prompt_name" ]; then
+        final_prompt=$(create_prompt_with_system "$prompt" "$system_prompt_name")
+    fi
+    local escaped_prompt=$(echo -n "$final_prompt" | sed 's/"/\\"/g')
+
+    # API 요청 데이터 구성
+    local request_data="{
+        \"prompt\": \"$escaped_prompt\",
+        \"max_tokens\": $MAX_TOKENS,
+        \"temperature\": $TEMPERATURE,
+        \"top_p\": $TOP_P,
+        \"top_k\": $TOP_K,
+        \"frequency_penalty\": $FREQUENCY_PENALTY,
+        \"presence_penalty\": $PRESENCE_PENALTY,
+        \"repetition_penalty\": $REPETITION_PENALTY,
+        \"stream\": $STREAMING
+    }"
+
+    local response=""
+
+    # 스트리밍 모드
+    if [ "$STREAMING" = "true" ]; then
+        # 임시 파일 생성 (전역 변수로 설정)
+        export SSE_RESPONSE_FILE=$(mktemp)
+
+        # 직접 curl 요청 (파이프 없이)
+        curl -s -X POST "$SERVER_URL" \
+          -H "Content-Type: application/json; charset=utf-8" \
+          -H "Accept: text/event-stream" \
+          -d "$request_data" \
+          --no-buffer | process_sse
+
+        # 결과 파일에서 최종 응답 읽기
+        response=$(cat "$SSE_RESPONSE_FILE")
+        rm "$SSE_RESPONSE_FILE"
+    else
+        # 비스트리밍 모드 (변경 없음)
+        local api_response=$(curl -s -X POST "$SERVER_URL" \
+          -H "Content-Type: application/json; charset=utf-8" \
+          -H "Accept: application/json; charset=utf-8" \
+          -d "$request_data")
+
+        # JSON 파싱
+        response=$(echo "$api_response" | jq -r '.generated_text // empty')
+
+        if [ -z "$response" ]; then
+            error=$(echo "$api_response" | jq -r '.error // "알 수 없는 오류"')
+            echo -e "${RED}오류: $error${NC}"
+            return 1
+        fi
+    fi
+
+    # 응답이 비어있는지 확인
+    if [ -z "$response" ]; then
+        echo -e "\n${RED}오류: 빈 응답을 받았습니다.${NC}"
+        return 1
+    fi
+
+    # 히스토리에 추가
+    add_to_history "$prompt" "$response"
+
+    # 스트리밍 모드에서는 마크다운 렌더링 건너뛰기
+    if [ "$STREAMING" = "false" ] && [ "$MARKDOWN_MODE" = "true" ]; then
+        render_markdown "$response"
+    fi
+
+    return 0
+}
+
+# 서버 연결 확인
+check_server() {
+    local url="$1"
+    local host=$(echo "$url" | sed -E 's|^https?://||' | sed -E 's|/.*$||' | cut -d: -f1)
+    local port=$(echo "$url" | sed -E 's|^https?://||' | sed -E 's|/.*$||' | grep -o ':[0-9]*' | cut -d: -f2)
+
+    # 기본 포트 설정 (지정되지 않은 경우)
+    if [ -z "$port" ]; then
+        if [[ "$url" == https://* ]]; then
+            port="443"
+        else
+            port="80"
+        fi
+    fi
+
+    echo -e "${YELLOW}서버 연결 확인 중... ($host:$port)${NC}"
+
+    # 간단한 포트 연결 테스트
+    if command -v nc &> /dev/null; then
+        # netcat으로 테스트
+        if nc -z -w 3 "$host" "$port" 2>/dev/null; then
+            echo -e "${GREEN}서버 연결 성공!${NC}"
+            return 0
+        else
+            echo -e "${RED}오류: 서버에 연결할 수 없습니다.${NC}"
+            echo -e "${YELLOW}서버가 실행 중인지 확인하고, 올바른 URL을 설정했는지 확인하세요.${NC}"
+            echo -e "${YELLOW}현재 서버 URL: $SERVER_URL${NC}"
+            return 1
+        fi
+    else
+        # netcat이 없는 경우 curl로 대체
+        local timeout=3
+        local status=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout "$timeout" "$url" 2>/dev/null || echo "error")
+
+        if [[ "$status" != "error" ]]; then
+            echo -e "${GREEN}서버 연결 성공!${NC}"
+            return 0
+        else
+            echo -e "${RED}오류: 서버에 연결할 수 없습니다.${NC}"
+            echo -e "${YELLOW}서버가 실행 중인지 확인하고, 올바른 URL을 설정했는지 확인하세요.${NC}"
+            echo -e "${YELLOW}현재 서버 URL: $SERVER_URL${NC}"
+            return 1
+        fi
+    fi
+}
+
+# 디버그 정보 표시
+show_debug_info() {
+    echo -e "${BLUE}=====================================================${NC}"
+    echo -e "${YELLOW}디버그 정보:${NC}"
+    echo -e "${CYAN}시스템 정보:${NC}"
+    echo -e "  OS: $(uname -a)"
+    echo -e "  Bash 버전: $BASH_VERSION"
+
+    echo -e "\n${CYAN}의존성:${NC}"
+    echo -e "  curl: $(curl --version | head -n 1)"
+    echo -e "  jq: $(jq --version 2>/dev/null || echo '설치되지 않음')"
+    echo -e "  glow: $(command -v glow >/dev/null && echo '설치됨' || echo '설치되지 않음')"
+
+    echo -e "\n${CYAN}서버 연결 테스트:${NC}"
+    local server_status=$(curl -s -o /dev/null -w "%{http_code}" "$SERVER_URL" 2>/dev/null || echo "연결 실패")
+
+    if [[ "$server_status" == "200" ]]; then
+        echo -e "  서버 상태: ${GREEN}정상${NC} (HTTP 200)"
+    elif [[ "$server_status" == "연결 실패" ]]; then
+        echo -e "  서버 상태: ${RED}연결 실패${NC} ($SERVER_URL)"
+    else
+        echo -e "  서버 상태: ${YELLOW}응답 코드 $server_status${NC} ($SERVER_URL)"
+    fi
+
+    echo -e "\n${CYAN}구성 파일:${NC}"
+    echo -e "  경로: $CONFIG_FILE"
+    if [ -f "$CONFIG_FILE" ]; then
+        echo -e "  크기: $(du -h "$CONFIG_FILE" | cut -f1)"
+        echo -e "  최종 수정: $(date -r "$CONFIG_FILE" '+%Y-%m-%d %H:%M:%S')"
+    else
+        echo -e "  ${RED}파일이 존재하지 않습니다${NC}"
+    fi
+
+    echo -e "\n${CYAN}히스토리 파일:${NC}"
+    echo -e "  경로: $HISTORY_FILE"
+    if [ -f "$HISTORY_FILE" ]; then
+        local history_count=$(wc -l < "$HISTORY_FILE")
+        echo -e "  대화 수: $history_count"
+        echo -e "  크기: $(du -h "$HISTORY_FILE" | cut -f1)"
+        echo -e "  최종 수정: $(date -r "$HISTORY_FILE" '+%Y-%m-%d %H:%M:%S')"
+    else
+        echo -e "  ${RED}파일이 존재하지 않습니다${NC}"
+    fi
+
+    echo -e "${BLUE}=====================================================${NC}"
+}
+
+# 명령 처리기
+process_command() {
+    local cmd="$1"
+    shift
+    local args=("$@")
+
+    case "$cmd" in
+        .exit|.bye)
+            echo -e "${BLUE}대화를 종료합니다. 안녕히 가세요!${NC}"
+            exit 0
+            ;;
+        .help)
+            show_help
+            return 0
+            ;;
+        .params)
+            manage_parameters
+            return 0
+            ;;
+        .preset)
+            apply_preset "${args[0]}"
+            return 0
+            ;;
+        .save_preset)
+            save_preset "${args[0]}"
+            return 0
+            ;;
+        .prompts)
+            load_system_prompt
+            return 0
+            ;;
+        .use)
+            CURRENT_SYSTEM_PROMPT="${args[0]}"
+            echo -e "${GREEN}시스템 프롬프트 '${args[0]}'를 사용합니다.${NC}"
+            return 0
+            ;;
+        .save_prompt)
+            prompt_name="${args[0]}"
+            # args[0]를 제외한 나머지 모든 인수를 프롬프트 내용으로 결합
+            shift 1
+            prompt_content="$*"
+            save_system_prompt "$prompt_name" "$prompt_content"
+            return 0
+            ;;
+        .history)
+            show_history "${args[0]}"
+            return 0
+            ;;
+        .clear_history)
+            clear_history
+            return 0
+            ;;
+        .r)
+            local history_num="${args[0]}"
+            local prompt=$(get_history_entry "$history_num")
+            if [[ "$prompt" == error:* ]]; then
+                echo -e "${RED}오류: 유효하지 않은 히스토리 항목 번호입니다.${NC}"
+                return 1
+            fi
+            echo -e "${YELLOW}이전 질문:${NC} $prompt"
+            call_api "$prompt" "$CURRENT_SYSTEM_PROMPT"
+            return $?
+            ;;
+        .toggle_md)
+            toggle_markdown_mode
+            return 0
+            ;;
+        .toggle_stream)
+            toggle_streaming_mode
+            return 0
+            ;;
+        *)
+            echo -e "${RED}알 수 없는 명령어: $cmd${NC}"
+            echo -e "${YELLOW}도움말을 보려면 .help를 입력하세요.${NC}"
+            return 1
+            ;;
+    esac
+}
+
+# 메인 함수
+main() {
+    # 의존성 확인
+    check_dependencies
+
+    # 설정 및 히스토리 초기화
+    load_config
+    init_history
+
+    # 현재 시스템 프롬프트
+    CURRENT_SYSTEM_PROMPT=""
+
+    # 배너 표시
+    show_banner
+
+    # 서버 상태 확인
+    check_server "$SERVER_URL"
+
+    # 대화 루프
+    while true; do
+        # 사용자 입력 받기
+        echo -e "\n${YELLOW}질문: ${NC}"
+        read -e -r PROMPT
+
+        # 빈 입력 처리
+        if [ -z "$PROMPT" ]; then
+            echo -e "${YELLOW}질문을 입력해주세요.${NC}"
+            continue
+        fi
+
+        # 명령어 처리
+        if [[ "$PROMPT" == .* ]]; then
+            # 공백으로 명령어와 인수 분리
+            read -ra CMD_ARGS <<< "$PROMPT"
+            cmd="${CMD_ARGS[0]}"
+            args=("${CMD_ARGS[@]:1}")
+
+            process_command "$cmd" "${args[@]}"
+            continue
+        fi
+
+        # 일반 질문 처리
+        echo -e "${GREEN}응답: ${NC}"
+        call_api "$PROMPT" "$CURRENT_SYSTEM_PROMPT"
+
+        # 구분선 추가
+        echo -e "\n${BLUE}----------------------------------------------------${NC}"
+    done
+}
+
+# 스크립트 실행
+main "$@"
+
+# 스크립트 종료
+exit 0
